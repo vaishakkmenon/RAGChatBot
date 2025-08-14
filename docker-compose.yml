@@ -1,0 +1,42 @@
+name: RAGChatBot
+services:
+  api:
+    build: .
+    container_name: ragchatbot_api
+    working_dir: /workspace
+    ports:
+      - "8000:8000"
+    environment:
+      - WATCHFILES_FORCE_POLLING=1
+    env_file:
+      - .env
+    volumes:
+      - ./:/workspace
+      - ./.env:/workspace/.env:ro
+    depends_on:
+      - ollama
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    cap_drop: ["ALL"]
+    tmpfs:
+      - /tmp
+    user: "65532:65532"
+    healthcheck:
+      test: ["CMD", "/opt/venv/bin/python","-c","import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8000)); print('ok')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ragchatbot_ollama
+    ports:
+      - "11434:11434"           # optional: exposes Ollama to your host
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama_models:
