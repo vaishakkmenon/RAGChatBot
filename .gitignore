@@ -1,5 +1,10 @@
+# Environment Variables
 .env
 .env.*
 !.env.example
 
+# Python Pycache
 app/__pycache__
+
+# Specific Files
+Rag Chatbot Scaffold.pdf
