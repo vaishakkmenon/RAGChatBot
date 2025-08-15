@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.concurrency import run_in_threadpool
 
 from .models import QuestionRequest
+from .middleware.max_size import MaxSizeMiddleware
 
 _CLIENT = ollama.Client(host=os.getenv("OLLAMA_HOST", "http://ollama:11434"))
 _MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M")
@@ -13,21 +14,15 @@ _NUM_CTX = int(os.getenv("NUM_CTX", "2048") or 2048)
 REQUEST_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT", "60") or 60)
 MAX_BYTES = 32768
 
-
 app = FastAPI(title="RAGChatBot")
+app.add_middleware(MaxSizeMiddleware, max_bytes=MAX_BYTES)
 
 @app.get("/")
 def root():
     return {"ok": True, "message": "Hello from RAGChatBot"}
 
-
-async def size_guard(request: Request):
-    cl = request.headers.get("content-length")
-    if cl and int(cl) > MAX_BYTES:
-        raise HTTPException(status_code=413, detail="payload too large")
-
 @app.post("/chat-test")
-async def chat_test(req: QuestionRequest, _: None = Depends(size_guard)):
+async def chat_test(req: QuestionRequest):
     prompt = req.question
     start = time.perf_counter()
 

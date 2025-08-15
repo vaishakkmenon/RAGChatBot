@@ -5,6 +5,7 @@
 
 # Python Pycache
 app/__pycache__
+app/middleware/__pycache__
 
 # Specific Files
 Rag Chatbot Scaffold.pdf
