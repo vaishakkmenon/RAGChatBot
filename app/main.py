@@ -1,7 +1,7 @@
 import os, asyncio, time
 import ollama
 import socket
-import requests
+import httpx
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.concurrency import run_in_threadpool
 
@@ -46,10 +46,11 @@ async def chat_test(req: QuestionRequest, _: None = Depends(size_guard)):
         return {"ok": True, "answer": answer, "elapsed_ms": elapsed_ms}
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail=f"Upstream timeout after {REQUEST_TIMEOUT_S}s")
-    except (requests.exceptions.RequestException, OSError, socket.gaierror, socket.timeout,
+    except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+            httpx.TransportError, OSError, socket.gaierror, socket.timeout,
             ConnectionResetError, BrokenPipeError) as e:
         raise HTTPException(status_code=503, detail="Ollama unreachable") from e
-    except (ValueError, KeyError, TypeError, requests.exceptions.HTTPError) as e:
+    except (httpx.HTTPStatusError, ValueError, KeyError, TypeError) as e:
         raise HTTPException(status_code=502, detail="Upstream error") from e
         
 @app.get("/health/ollama")
@@ -72,8 +73,11 @@ async def ollama_health():
         }
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail=f"Upstream timeout after {REQUEST_TIMEOUT_S}s")
-    except (requests.exceptions.RequestException, OSError, socket.gaierror, socket.timeout,
+    except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+            httpx.TransportError, OSError, socket.gaierror, socket.timeout,
             ConnectionResetError, BrokenPipeError) as e:
         raise HTTPException(status_code=503, detail="Ollama unreachable") from e
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail="Upstream error") from e
     except Exception as e:
         raise HTTPException(status_code=502, detail="Upstream error") from e
