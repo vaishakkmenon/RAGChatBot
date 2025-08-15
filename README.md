@@ -35,7 +35,7 @@ This project runs in a **containerized development environment** using [Docker](
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/ragchatbot.git
+git clone https://github.com/vaishakkmenon/ragchatbot.git
 cd ragchatbot
 ```
 
