@@ -5,16 +5,17 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
+from .settings import settings
 from .models import QuestionRequest
 from .middleware.max_size import MaxSizeMiddleware
 from .middleware.logging import LoggingMiddleware
 
 
-_CLIENT = ollama.Client(host=os.getenv("OLLAMA_HOST", "http://ollama:11434"))
-_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M")
-_NUM_CTX = int(os.getenv("NUM_CTX", "2048") or 2048)
-REQUEST_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT", "60") or 60)
-MAX_BYTES = 32768
+_CLIENT = ollama.Client(host=settings.ollama_host)
+_MODEL = settings.ollama_model
+_NUM_CTX = settings.num_ctx
+REQUEST_TIMEOUT_S = settings.ollama_timeout
+MAX_BYTES = settings.max_bytes
 
 app = FastAPI(title="RAGChatBot")
 app.add_middleware(LoggingMiddleware)
