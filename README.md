@@ -102,3 +102,23 @@ docker compose down --rmi all --volumes
 ```
 
 > **Warning:** The full cleanup command will permanently delete all Ollama models and ChromaDB index data.
+
+# Project Progress
+
+## Phase 1 – API Foundation
+
+* Containerized FastAPI service with Docker Compose.
+* Configurable via `.env` for model, host, and context settings.
+* Added `/` root endpoint for health check.
+
+## Phase 2 – Model Integration
+
+* Connected to Ollama for LLM inference.
+* `/chat-test` endpoint sends user prompts to the model and returns answers with latency.
+* `/health/ollama` endpoint checks model availability and readiness.
+
+## Phase 3 – Middleware & Guardrails
+
+* **Request Size Limit**: Rejects POST bodies > 32 KB before parsing (413).
+* **Structured JSON Logging**: One log entry per request with request ID, method, path, status, latency, and model info.
+* **Robust Error Handling**: Clear HTTP codes for timeouts, connectivity failures, and upstream errors.

@@ -2,11 +2,13 @@ import os, asyncio, time
 import ollama
 import socket
 import httpx
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
 from .models import QuestionRequest
 from .middleware.max_size import MaxSizeMiddleware
+from .middleware.logging import LoggingMiddleware
+
 
 _CLIENT = ollama.Client(host=os.getenv("OLLAMA_HOST", "http://ollama:11434"))
 _MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M")
@@ -15,6 +17,7 @@ REQUEST_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT", "60") or 60)
 MAX_BYTES = 32768
 
 app = FastAPI(title="RAGChatBot")
+app.add_middleware(LoggingMiddleware)
 app.add_middleware(MaxSizeMiddleware, max_bytes=MAX_BYTES)
 
 @app.get("/")
@@ -64,6 +67,7 @@ async def ollama_health():
             "host": os.getenv("OLLAMA_HOST", ""),
             "model": _MODEL,
             "model_ready": bool(model_ready),
+            "num_ctx": _NUM_CTX,
             "elapsed_ms": elapsed_ms,
         }
     except asyncio.TimeoutError:
