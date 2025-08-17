@@ -3,13 +3,34 @@
 .env.*
 !.env.example
 
-# Python Pycache
-app/__pycache__
-app/middleware/__pycache__
+# Python cache, venvs, tools
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.envrc
 
-# Specific Files
-Rag Chatbot Scaffold.pdf
+# Editors/OS junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 
-# Data files and such
+# Data/model caches
 data/chroma/
 hf_cache/
+
+# Docs (if not sharing actual docs, otherwise skip this block)
+data/docs/*
+!data/docs/hello.md
+
+# Logs (optional)
+*.log
+logs/
+
+# Project files
+Rag Chatbot Scaffold.pdf
