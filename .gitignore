@@ -9,3 +9,7 @@ app/middleware/__pycache__
 
 # Specific Files
 Rag Chatbot Scaffold.pdf
+
+# Data files and such
+data/chroma/
+hf_cache/

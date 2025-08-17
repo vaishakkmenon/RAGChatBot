@@ -13,6 +13,7 @@ services:
     volumes:
       - ./:/workspace
       - ./.env:/workspace/.env:ro
+      - ./hf_cache:/home/nonroot/.cache/huggingface
     depends_on:
       - ollama
     security_opt:

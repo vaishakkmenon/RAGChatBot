@@ -2,14 +2,20 @@ import os, asyncio, time
 import ollama
 import socket
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 
+from .retrieval import search
 from .settings import settings
-from .models import QuestionRequest
-from .middleware.max_size import MaxSizeMiddleware
+from .ingest import ingest_paths
 from .middleware.logging import LoggingMiddleware
+from .middleware.max_size import MaxSizeMiddleware
+from .models import QuestionRequest, IngestRequest, IngestResponse
 
+
+
+import logging
+logger = logging.getLogger(__name__)
 
 _CLIENT = ollama.Client(host=settings.ollama_host)
 _MODEL = settings.ollama_model
@@ -81,3 +87,26 @@ async def ollama_health():
         raise HTTPException(status_code=502, detail="Upstream error") from e
     except Exception as e:
         raise HTTPException(status_code=502, detail="Upstream error") from e
+
+@app.post("/ingest", response_model=IngestResponse)
+async def ingest_data(req: IngestRequest):
+    paths = req.paths
+    try:
+        doc_len = ingest_paths(paths)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=f"File not found: {e}")
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=f"Permission error: {e}")
+    except Exception as e:
+        logger.exception("Error during ingestion")
+        raise HTTPException(status_code=500, detail="Unexpected error during ingestion")
+    logger.info(f"Ingested {doc_len} chunks from {paths or settings.docs_dir}")
+    return IngestResponse(ingested_chunks=doc_len)
+
+@app.get("/debug-search")
+def debug_search(
+    q: str = Query(..., description="Search query string"),
+    k: int = Query(4, description="Number of top results to return"),
+):
+    results = search(q, k)
+    return {"matches": results}
