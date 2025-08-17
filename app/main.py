@@ -122,8 +122,6 @@ def debug_search(
         "count": len(results)
     }
 
-from fastapi import HTTPException
-
 @app.post("/chat")
 async def chat(req: ChatRequest):
     user_question = req.question
