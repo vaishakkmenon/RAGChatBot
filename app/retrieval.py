@@ -1,9 +1,12 @@
+import logging
 import chromadb
 from .settings import settings
 from typing import List, Optional
 from chromadb.config import Settings as ChromaSettings
 from sentence_transformers import SentenceTransformer
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+logger = logging.getLogger(__name__)
 
 
 # Instantiate the embedding function singleton
@@ -33,7 +36,7 @@ def add_documents(docs: List[dict]) -> None:
 def search(query: str, k: Optional[int] = None, min_score: float = 0.35) -> List[dict]:
     k = k or settings.top_k
     
-    res = _collection.query(query_texts=[query], n_results=k) or {}
+    res = _collection.query(query_texts=[query], n_results=k, include=["distances"]) or {}
     docs = (res.get("documents") or [[]])[0]
     ids = (res.get("ids") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
@@ -43,5 +46,5 @@ def search(query: str, k: Optional[int] = None, min_score: float = 0.35) -> List
     for i, t, m, d in zip(ids, docs, metas, dists):
         if d <= min_score:
             out.append({"id": i, "text": t, "source": m.get("source", "unknown"), "distance": d})
-                
+    logger.info(f"Search '{query}': {len(out)}/{k} results above min_score {min_score}")
     return out
