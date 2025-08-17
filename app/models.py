@@ -9,3 +9,7 @@ class IngestRequest(BaseModel):
     
 class IngestResponse(BaseModel):
     ingested_chunks: int
+    
+class ChatRequest(BaseModel):
+    question: str
+    top_k: Optional[int] = 4

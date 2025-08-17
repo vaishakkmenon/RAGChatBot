@@ -10,7 +10,7 @@ from .settings import settings
 from .ingest import ingest_paths
 from .middleware.logging import LoggingMiddleware
 from .middleware.max_size import MaxSizeMiddleware
-from .models import QuestionRequest, IngestRequest, IngestResponse
+from .models import QuestionRequest, IngestRequest, IngestResponse, ChatRequest
 
 
 
@@ -110,3 +110,46 @@ def debug_search(
 ):
     results = search(q, k)
     return {"matches": results}
+
+from fastapi import HTTPException
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    user_question = req.question
+    top_k = req.top_k if req.top_k is not None else settings.top_k
+    retrieved_chunks = search(user_question, top_k)
+    context_chunks = [match['text'] for match in retrieved_chunks]
+    context = "\n\n".join(context_chunks)
+    llm_prompt = (
+        "Answer the question using only the information below.\n"
+        "Context:\n"
+        f"{context}\n\n"
+        f"Question: {user_question}"
+    )
+
+    async def _call_chat():
+        return await run_in_threadpool(
+            _CLIENT.chat,
+            model=settings.ollama_model,
+            messages=[{"role": "user", "content": llm_prompt}],
+            options={"num_ctx": settings.num_ctx},
+        )
+
+    try:
+        resp = await asyncio.wait_for(_call_chat(), timeout=settings.ollama_timeout)
+        answer = resp.get("message", {}).get("content", "")
+        return {
+            "answer": answer,
+            "sources": [
+                {"id": match["id"], "source": match["source"]}
+                for match in retrieved_chunks
+            ]
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"Upstream timeout after {settings.ollama_timeout}s")
+    except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+            httpx.TransportError, OSError, socket.gaierror, socket.timeout,
+            ConnectionResetError, BrokenPipeError) as e:
+        raise HTTPException(status_code=503, detail="Ollama unreachable") from e
+    except (httpx.HTTPStatusError, ValueError, KeyError, TypeError) as e:
+        raise HTTPException(status_code=502, detail="Upstream error") from e
