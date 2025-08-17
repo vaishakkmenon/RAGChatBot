@@ -30,16 +30,18 @@ def add_documents(docs: List[dict]) -> None:
         metadatas=[{"source": d["source"]} for d in docs],
     )
 
-def search(query: str, k: Optional[int] = None) -> List[dict]:
-    k = k if k is not None else settings.top_k
+def search(query: str, k: Optional[int] = None, min_score: float = 0.35) -> List[dict]:
+    k = k or settings.top_k
     
     res = _collection.query(query_texts=[query], n_results=k) or {}
     docs = (res.get("documents") or [[]])[0]
     ids = (res.get("ids") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
+    dists = (res.get("distances") or [[]])[0]
     
     out = []
-    for i, t, m in zip(ids, docs, metas):
-        out.append({"id": i, "text": t, "source": m.get("source", "unknown")})
-    
+    for i, t, m, d in zip(ids, docs, metas, dists):
+        if d <= min_score:
+            out.append({"id": i, "text": t, "source": m.get("source", "unknown"), "distance": d})
+                
     return out
