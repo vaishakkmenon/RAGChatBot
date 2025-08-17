@@ -105,8 +105,8 @@ async def ingest_data(req: IngestRequest):
 
 @app.get("/debug-search")
 def debug_search(
-    q: str = Query(..., description="Search query string"),
-    k: int = Query(4, description="Number of top results to return"),
+    q: str = Query(..., description="Search query string", min_length=1),
+    k: int = Query(4, description="Number of top results to return", ge=1, le=20),
 ):
     results = search(q, k)
     logger.info(f"Debug-search: q='{q}', k={k}, matches={len(results)}")
