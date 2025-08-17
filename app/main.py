@@ -109,7 +109,18 @@ def debug_search(
     k: int = Query(4, description="Number of top results to return"),
 ):
     results = search(q, k)
-    return {"matches": results}
+    logger.info(f"Debug-search: q='{q}', k={k}, matches={len(results)}")
+    return {
+        "matches": [
+            {
+                "id": r["id"],
+                "source": r["source"],
+                "text": r["text"][:200] + ("..." if len(r["text"]) > 200 else "")
+            }
+            for r in results
+        ],
+        "count": len(results)
+    }
 
 from fastapi import HTTPException
 
