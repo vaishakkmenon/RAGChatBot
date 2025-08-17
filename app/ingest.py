@@ -22,6 +22,8 @@ def find_files(base_paths: List[str]) -> List[str]:
                 for name in fs:
                     if os.path.splitext(name)[1].lower() in ALLOWED_EXT:
                         files.append(os.path.join(root, name))
+    if not files:
+        raise HTTPException(status_code=400, detail="No files found to ingest.")
     return files
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
