@@ -1,9 +1,12 @@
 import os
+import logging
 from typing import List, Dict, Optional
 from .retrieval import add_documents
 from .settings import settings
+from fastapi import HTTPException
 
 ALLOWED_EXT = {".txt", ".md"}
+MAX_FILE_SIZE = 5 * 1024 * 1024
 
 def read_text(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -40,13 +43,34 @@ def ingest_paths(paths: Optional[List[str]] = None) -> int:
     files = find_files(base_paths)
     docs: List[Dict] = [] 
     for fp in files:
-        text = read_text(fp)
+        try:
+            file_size = os.path.getsize(fp)
+        except Exception as e:
+            logging.warning(f"Could not stat file {fp}: {e}")
+            continue
+        if file_size > MAX_FILE_SIZE:
+            logging.warning(f"Skipping {fp}: file too large ({file_size} bytes)")
+            continue
+
+        try:
+            text = read_text(fp)
+        except Exception as e:
+            logging.warning(f"Could not read {fp}: {e}")
+            continue
+        
         chunks = chunk_text(text, settings.chunk_size, settings.chunk_overlap)
+        if not chunks:
+            logging.warning(f"File {fp} produced no valid chunks (empty or whitespace).")
+            continue
+
         for idx, ch in enumerate(chunks):
             docs.append({
                 "id": f"{fp}:{idx}",
                 "text": ch,
                 "source": fp,
             })
+        logging.info(f"{fp}: {len(chunks)} chunks")
+
     add_documents(docs)
+    logging.info(f"Ingested {len(docs)} chunks from {len(files)} files (skipped files may reduce this count).")
     return len(docs)
