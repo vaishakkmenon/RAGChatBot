@@ -3,7 +3,6 @@ import chromadb
 from .settings import settings
 from typing import List, Optional
 from chromadb.config import Settings as ChromaSettings
-from sentence_transformers import SentenceTransformer
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 logger = logging.getLogger(__name__)
@@ -48,3 +47,17 @@ def search(query: str, k: Optional[int] = None, min_score: float = 0.35) -> List
             out.append({"id": i, "text": t, "source": m.get("source", "unknown"), "distance": d})
     logger.info(f"Search '{query}': {len(out)}/{k} results above min_score {min_score}")
     return out
+
+def get_sample_chunks(n=10):
+    res = _collection.get(limit=n)
+    ids = res.get("ids") or []
+    metadatas = res.get("metadatas") or []
+    docs = res.get("documents") or []
+    return [
+        {
+            "id": i,
+            "source": (meta.get("source") if meta else "unknown"),
+            "text": (text[:120] + ("..." if text and len(text) > 120 else ""))
+        }
+        for i, meta, text in zip(ids, metadatas, docs)
+    ]

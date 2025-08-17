@@ -5,9 +5,9 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 
-from .retrieval import search
 from .settings import settings
 from .ingest import ingest_paths
+from .retrieval import search, get_sample_chunks
 from .middleware.logging import LoggingMiddleware
 from .middleware.max_size import MaxSizeMiddleware
 from .models import QuestionRequest, IngestRequest, IngestResponse, ChatRequest
@@ -103,26 +103,6 @@ async def ingest_data(req: IngestRequest):
     logger.info(f"Ingested {doc_len} chunks from {paths or settings.docs_dir}")
     return IngestResponse(ingested_chunks=doc_len)
 
-@app.get("/debug-search")
-def debug_search(
-    q: str = Query(..., description="Search query string", min_length=1),
-    k: int = Query(4, description="Number of top results to return", ge=1, le=20),
-    similarity: float = Query(0.35, ge=0.0, le=1.0, description="Minimum similarity threshold (lower = stricter, 0.25-0.4 typical)")
-):
-    results = search(q, k, similarity)
-    logger.info(f"Debug-search: q='{q}', k={k}, similarity={similarity}, matches={len(results)}")
-    return {
-        "matches": [
-            {
-                "id": r["id"],
-                "source": r["source"],
-                "text": r["text"][:200] + ("..." if len(r["text"]) > 200 else "")
-            }
-            for r in results
-        ],
-        "count": len(results)
-    }
-
 @app.post("/chat")
 async def chat(
     req: ChatRequest, 
@@ -166,3 +146,30 @@ async def chat(
         raise HTTPException(status_code=503, detail="Ollama unreachable") from e
     except (httpx.HTTPStatusError, ValueError, KeyError, TypeError) as e:
         raise HTTPException(status_code=502, detail="Upstream error") from e
+
+@app.get("/debug-search")
+def debug_search(
+    q: str = Query(..., description="Search query string", min_length=1),
+    k: int = Query(4, description="Number of top results to return", ge=1, le=20),
+    similarity: float = Query(0.35, ge=0.0, le=1.0, description="Minimum similarity threshold (lower = stricter, 0.25-0.4 typical)")
+):
+    results = search(q, k, similarity)
+    logger.info(f"Debug-search: q='{q}', k={k}, similarity={similarity}, matches={len(results)}")
+    return {
+        "matches": [
+            {
+                "id": r["id"],
+                "source": r["source"],
+                "text": r["text"][:200] + ("..." if len(r["text"]) > 200 else "")
+            }
+            for r in results
+        ],
+        "count": len(results)
+    }
+
+@app.get("/debug-ingest")
+def debug_ingest(
+    n: int = Query(10, ge=1, le=50, description="Number of sample chunks to show")
+):
+    out = get_sample_chunks(n)
+    return {"chunks": out, "count": len(out)}
