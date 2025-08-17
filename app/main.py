@@ -107,9 +107,10 @@ async def ingest_data(req: IngestRequest):
 def debug_search(
     q: str = Query(..., description="Search query string", min_length=1),
     k: int = Query(4, description="Number of top results to return", ge=1, le=20),
+    similarity: float = Query(0.35, ge=0.0, le=1.0, description="Minimum similarity threshold (lower = stricter, 0.25-0.4 typical)")
 ):
-    results = search(q, k)
-    logger.info(f"Debug-search: q='{q}', k={k}, matches={len(results)}")
+    results = search(q, k, similarity)
+    logger.info(f"Debug-search: q='{q}', k={k}, similarity={similarity}, matches={len(results)}")
     return {
         "matches": [
             {
@@ -123,10 +124,13 @@ def debug_search(
     }
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(
+    req: ChatRequest, 
+    similarity: float = Query(0.35, ge=0.0, le=1.0, description="Minimum similarity threshold (lower = stricter, 0.25-0.4 typical)")
+):
     user_question = req.question
     top_k = req.top_k if req.top_k is not None else settings.top_k
-    retrieved_chunks = search(user_question, top_k)
+    retrieved_chunks = search(user_question, top_k, similarity)
     context_chunks = [match['text'] for match in retrieved_chunks]
     context = "\n\n".join(context_chunks)
     llm_prompt = (
