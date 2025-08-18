@@ -1,0 +1,19 @@
+:: 1) Health
+curl -i -X GET "http://127.0.0.1:8000/" -H "X-API-Key: my-dev-key-1"
+
+:: 2) Re-ingest
+curl -i -X POST "http://127.0.0.1:8000/ingest" -H "Content-Type: application/json" -H "X-API-Key: my-dev-key-1" --data "{\"paths\":[\"data/docs\"]}"
+
+:: 3) Sample chunks
+curl -i -X GET "http://127.0.0.1:8000/debug-ingest?n=5" -H "X-API-Key: my-dev-key-1"
+
+:: 4) Retrieval sanity
+curl -i -X GET "http://127.0.0.1:8000/debug-search?q=RAG&k=4&max_distance=0.6" -H "X-API-Key: my-dev-key-1"
+curl -i -X GET "http://127.0.0.1:8000/debug-search?q=docker%20containers&k=4&max_distance=0.8" -H "X-API-Key: my-dev-key-1"
+curl -i -X GET "http://127.0.0.1:8000/debug-search?q=trombone%20recipes&k=4&max_distance=0.6" -H "X-API-Key: my-dev-key-1"
+
+:: 5) Model only
+curl -i -X POST "http://127.0.0.1:8000/chat-test" -H "Content-Type: application/json" -H "X-API-Key: my-dev-key-1" --data "{\"question\":\"Say hello in five words.\"}"
+
+:: 6) Full chat with retrieval
+curl -i -X POST "http://127.0.0.1:8000/chat" -H "Content-Type: application/json" -H "X-API-Key: my-dev-key-1" --data "{\"question\":\"Summarize the Docker basics from my docs and cite the source.\"}"

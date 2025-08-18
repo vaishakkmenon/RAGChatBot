@@ -30,6 +30,7 @@ class Settings(BaseModel):
     chroma_dir: str = os.getenv("CHROMA_DIR", "./data/chroma")
     docs_dir: str = os.getenv("DOCS_DIR", "./data/docs")
 
+    max_distance: float = float(os.getenv("MAX_DISTANCE", "0.7"))
     top_k: int = int(os.getenv("TOP_K", 4))
     chunk_size: int = int(os.getenv("CHUNK_SIZE", 600))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", 120))
