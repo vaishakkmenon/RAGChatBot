@@ -153,10 +153,14 @@ async def ingest_data(req: IngestRequest):
 )
 async def chat(
     req: ChatRequest,
-    similarity: float = Query(
-        0.35,
-        ge=0.0, le=1.0,
-        description="Minimum similarity threshold for retrieval (lower = stricter match, 0.25-0.4 typical)"
+    max_distance: float = Query(
+        0.65,
+        ge=0.0, le=2.0,
+        description=(
+            "Maximum vector distance allowed for retrieved chunks. "
+            "Lower = closer match, higher = looser match. "
+            "Typical values: 0.5-0.8 for cosine distance."
+        )
     )
 ):
     """
@@ -164,7 +168,7 @@ async def chat(
     """
     user_question = req.question
     top_k = req.top_k if req.top_k is not None else settings.top_k
-    retrieved_chunks = search(user_question, top_k, similarity)
+    retrieved_chunks = search(user_question, top_k, max_distance)
     context_chunks = [match['text'] for match in retrieved_chunks]
     context = "\n\n".join(context_chunks)
     llm_prompt = (
@@ -210,16 +214,19 @@ async def chat(
 def debug_search(
     q: str = Query(..., description="Search query string", min_length=1),
     k: int = Query(4, description="Number of top results to return", ge=1, le=20),
-    similarity: float = Query(
-        0.35, ge=0.0, le=1.0,
-        description="Minimum similarity threshold (lower = stricter, 0.25-0.4 typical)"
+    max_distance: float = Query(
+        0.65, ge=0.0, le=2.0,
+        description=(
+            "Maximum vector distance allowed for retrieved chunks. "
+            "Lower = closer match, higher = looser match."
+        )
     )
 ):
     """
     Directly query the retrieval database to see which chunks would be retrieved for a given string.
     """
-    results = search(q, k, similarity)
-    logger.info(f"Debug-search: q='{q}', k={k}, similarity={similarity}, matches={len(results)}")
+    results = search(q, k, max_distance)
+    logger.info(f"Debug-search: q='{q}', k={k}, distance={max_distance}, matches={len(results)}")
     return {
         "matches": [
             {

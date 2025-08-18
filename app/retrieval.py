@@ -42,7 +42,7 @@ def add_documents(docs: List[dict]) -> None:
 def search(
     query: str, 
     k: Optional[int] = None, 
-    min_score: float = 0.35
+    max_distance: float = 0.35
 ) -> List[dict]:
     """
     Retrieve top-k most similar document chunks to the query.
@@ -50,7 +50,7 @@ def search(
     Args:
         query (str): Search string.
         k (int, optional): Number of results to return. Defaults to settings.top_k.
-        min_score (float): Minimum similarity threshold (lower is stricter, e.g. 0.25-0.4).
+        max_distance (float): Maximum vector distance allowed (lower is stricter, e.g. 0.25-0.4).
     
     Returns:
         List[dict]: Matching chunks with id, text, source, and distance.
@@ -65,9 +65,9 @@ def search(
 
     out = []
     for i, t, m, d in zip(ids, docs, metas, dists):
-        if d <= min_score:
+        if d <= max_distance:
             out.append({"id": i, "text": t, "source": m.get("source", "unknown"), "distance": d})
-    logger.info(f"Search '{query}': {len(out)}/{k} results above min_score {min_score}")
+    logger.info(f"Search '{query}': {len(out)}/{k} results within max_distance  {max_distance}")
     return out
 
 def get_sample_chunks(n: int = 10) -> List[dict]:
