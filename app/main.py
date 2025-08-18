@@ -20,6 +20,7 @@ from .models import (
     ChatRequest,
     ChatResponse,
     ChatSource,
+    ErrorResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,14 @@ def root():
     summary="Quick LLM test (no retrieval)",
     response_description="Direct LLM answer for a test prompt.",
     tags=["LLM"],
+    responses={
+        400: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        413: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+        504: {"model": ErrorResponse},
+    },
 )
 async def chat_test(req: QuestionRequest):
     """
@@ -138,6 +147,15 @@ async def ollama_health():
     summary="Ingest documents into the retrieval database",
     response_description="Number of text chunks ingested from documents.",
     tags=["Documents"],
+    responses={
+        400: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        413: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+        504: {"model": ErrorResponse},
+    },
 )
 async def ingest_data(req: IngestRequest):
     """
@@ -161,7 +179,15 @@ async def ingest_data(req: IngestRequest):
 @app.post(
     "/chat",
     response_model=ChatResponse,
-    responses={200: {"content": {"application/json": {}, "text/event-stream": {}}}},
+    responses={
+        200: {"content": {"application/json": {}, "text/event-stream": {}}},
+        400: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        413: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+        504: {"model": ErrorResponse},
+    },
     summary="Ask a question over your ingested documents",
     response_description="LLM answer with supporting source chunks.",
     tags=["Chat"],
