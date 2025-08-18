@@ -36,8 +36,10 @@ class ChatRequest(BaseModel):
     )
 
 class ChatSource(BaseModel):
+    index: int = Field(description="Reference number used in the answer, starting from 1")
     id: str = Field(description="Unique identifier of the retrieved chunk")
-    source: str = Field(description="Original file path or source label of the chunk")
+    source: str = Field(description="Original file path or source label")
+    text: str = Field(description="The actual retrieved chunk text")
 
 
 class ChatResponse(BaseModel):

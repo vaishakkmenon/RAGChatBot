@@ -169,13 +169,19 @@ async def chat(
     user_question = req.question
     top_k = req.top_k if req.top_k is not None else settings.top_k
     retrieved_chunks = search(user_question, top_k, max_distance)
-    context_chunks = [match['text'] for match in retrieved_chunks]
-    context = "\n\n".join(context_chunks)
+
+    numbered_context = []
+    for i, match in enumerate(retrieved_chunks, start=1):
+        numbered_context.append(f"[{i}] {match['source']}\n{match['text']}")
+    context = "\n\n".join(numbered_context)
+
     llm_prompt = (
-        "Answer the question using only the information below.\n"
-        "Context:\n"
-        f"{context}\n\n"
-        f"Question: {user_question}"
+        "You are a concise assistant. Answer the question using ONLY the information below.\n"
+        "Cite sources in your answer using the reference numbers like [1], [2]. "
+        "If the answer is not contained in the context, say you do not know.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {user_question}\n\n"
+        "Answer:"
     )
 
     async def _call_chat():
@@ -192,8 +198,13 @@ async def chat(
         return ChatResponse(
             answer=answer,
             sources=[
-                ChatSource(id=match["id"], source=match["source"])
-                for match in retrieved_chunks
+                ChatSource(
+                    index=i,
+                    id=match["id"],
+                    source=match["source"],
+                    text=match["text"],
+                )
+                for i, match in enumerate(retrieved_chunks, start=1)
             ],
         )
     except asyncio.TimeoutError:
