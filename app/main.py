@@ -4,6 +4,8 @@ import socket
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
+from prometheus_fastapi_instrumentator import Instrumentator
+
 
 from .settings import settings
 from .ingest import ingest_paths
@@ -36,6 +38,7 @@ app = FastAPI(
 )
 app.add_middleware(LoggingMiddleware)
 app.add_middleware(MaxSizeMiddleware, max_bytes=MAX_BYTES)
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 @app.get(
     "/",
