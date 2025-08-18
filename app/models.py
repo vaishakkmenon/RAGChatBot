@@ -34,3 +34,14 @@ class ChatRequest(BaseModel):
         4,
         description="Maximum number of top document chunks to retrieve for context (1-20)."
     )
+
+class ChatSource(BaseModel):
+    id: str = Field(description="Unique identifier of the retrieved chunk")
+    source: str = Field(description="Original file path or source label of the chunk")
+
+
+class ChatResponse(BaseModel):
+    answer: str = Field(description="The LLM's final answer to the user's question")
+    sources: List[ChatSource] = Field(
+        description="List of supporting source chunks (IDs and source paths only)"
+    )

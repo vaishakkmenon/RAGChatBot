@@ -10,7 +10,14 @@ from .ingest import ingest_paths
 from .retrieval import search, get_sample_chunks
 from .middleware.logging import LoggingMiddleware
 from .middleware.max_size import MaxSizeMiddleware
-from .models import QuestionRequest, IngestRequest, IngestResponse, ChatRequest
+from .models import (
+    QuestionRequest,
+    IngestRequest,
+    IngestResponse,
+    ChatRequest,
+    ChatResponse,
+    ChatSource,
+)
 
 import logging
 logger = logging.getLogger(__name__)
@@ -139,10 +146,10 @@ async def ingest_data(req: IngestRequest):
 
 @app.post(
     "/chat",
+    response_model=ChatResponse,
     summary="Ask a question over your ingested documents",
     response_description="LLM answer with supporting source chunks.",
     tags=["Chat"],
-    # TODO: Add response_model=ChatResponse if model/return matches!
 )
 async def chat(
     req: ChatRequest,
@@ -178,14 +185,13 @@ async def chat(
     try:
         resp = await asyncio.wait_for(_call_chat(), timeout=settings.ollama_timeout)
         answer = resp.get("message", {}).get("content", "")
-        # NOTE: If you want the docs to show this shape, create and use a ChatResponse model here!
-        return {
-            "answer": answer,
-            "sources": [
-                {"id": match["id"], "source": match["source"]}
+        return ChatResponse(
+            answer=answer,
+            sources=[
+                ChatSource(id=match["id"], source=match["source"])
                 for match in retrieved_chunks
-            ]
-        }
+            ],
+        )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail=f"Upstream timeout after {settings.ollama_timeout}s")
     except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
