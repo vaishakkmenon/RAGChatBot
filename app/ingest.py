@@ -33,16 +33,34 @@ def find_files(base_paths: List[str]) -> List[str]:
         HTTPException: If no files are found to ingest.
     """
     files = []
+    base_docs_dir = os.path.abspath(settings.docs_dir)
+
     for base in base_paths:
-        if os.path.isfile(base):
-            files.append(base)
+        abs_base = os.path.abspath(base)
+
+        if not abs_base.startswith(base_docs_dir):
+            logging.warning(f"Skipping {base}: outside docs_dir {base_docs_dir}")
+            continue
+
+        if os.path.isfile(abs_base):
+            ext = os.path.splitext(abs_base)[1].lower()
+            if ext in ALLOWED_EXT:
+                files.append(abs_base)
+            else:
+                logging.warning(f"Skipping {abs_base}: invalid extension")
         else:
-            for root, _, fs in os.walk(base):
+            for root, _, fs in os.walk(abs_base):
                 for name in fs:
-                    if os.path.splitext(name)[1].lower() in ALLOWED_EXT:
-                        files.append(os.path.join(root, name))
+                    fp = os.path.join(root, name)
+                    ext = os.path.splitext(name)[1].lower()
+                    abs_fp = os.path.abspath(fp)
+                    if abs_fp.startswith(base_docs_dir) and ext in ALLOWED_EXT:
+                        files.append(abs_fp)
+                    else:
+                        logging.warning(f"Skipping {fp}: invalid or outside docs_dir")
+
     if not files:
-        raise HTTPException(status_code=400, detail="No files found to ingest.")
+        raise HTTPException(status_code=400, detail="No valid .txt or .md files found to ingest inside docs_dir.")
     return files
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
