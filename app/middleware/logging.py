@@ -4,6 +4,7 @@ from starlette.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# Logger for emitting one JSON line per request for API monitoring.
 json_logger = logging.getLogger("app.json")
 if not json_logger.handlers:
     h = logging.StreamHandler(sys.stdout)
@@ -16,7 +17,22 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M")
 
 class LoggingMiddleware(BaseHTTPMiddleware):
+    """
+    FastAPI/Starlette middleware to log a single JSON line for each HTTP request.
+    
+    Logs:
+        - request_id (UUID4)
+        - method, path, status
+        - elapsed_ms (wall time)
+        - ollama_host, ollama_model
+        - client_ip
+        - content_length (from headers)
+    Adds X-Request-Id to every response for traceability.
+    """
     async def dispatch(self, request, call_next):
+        """
+        Handles incoming request, logging info at start and completion (even on exceptions).
+        """
         rid = str(uuid.uuid4())
         start = time.perf_counter()
 

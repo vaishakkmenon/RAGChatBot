@@ -12,8 +12,6 @@ from .middleware.logging import LoggingMiddleware
 from .middleware.max_size import MaxSizeMiddleware
 from .models import QuestionRequest, IngestRequest, IngestResponse, ChatRequest
 
-
-
 import logging
 logger = logging.getLogger(__name__)
 
@@ -23,16 +21,35 @@ _NUM_CTX = settings.num_ctx
 REQUEST_TIMEOUT_S = settings.ollama_timeout
 MAX_BYTES = settings.max_bytes
 
-app = FastAPI(title="RAGChatBot")
+app = FastAPI(
+    title="RAGChatBot (Local $0)",
+    description="A fully local Retrieval-Augmented Generation chatbot. Ingest local docs and query them using Ollama LLM and ChromaDB, with source citation and tight OpenAPI docs.",
+    version="0.2.1",
+    summary="Self-hosted RAG chatbot using Ollama, SentenceTransformers, and ChromaDB."
+)
 app.add_middleware(LoggingMiddleware)
 app.add_middleware(MaxSizeMiddleware, max_bytes=MAX_BYTES)
 
-@app.get("/")
+@app.get(
+    "/",
+    summary="Health and available endpoints",
+    response_description="API status and supported endpoints.",
+    tags=["Health"],
+)
 def root():
+    """Returns API status and available endpoints."""
     return {"ok": True, "message": "Hello from RAGChatBot"}
 
-@app.post("/chat-test")
+@app.post(
+    "/chat-test",
+    summary="Quick LLM test (no retrieval)",
+    response_description="Direct LLM answer for a test prompt.",
+    tags=["LLM"],
+)
 async def chat_test(req: QuestionRequest):
+    """
+    Test prompt for direct LLM connection. Does **not** use retrieval/augmentation.
+    """
     prompt = req.question
     start = time.perf_counter()
 
@@ -57,9 +74,17 @@ async def chat_test(req: QuestionRequest):
         raise HTTPException(status_code=503, detail="Ollama unreachable") from e
     except (httpx.HTTPStatusError, ValueError, KeyError, TypeError) as e:
         raise HTTPException(status_code=502, detail="Upstream error") from e
-        
-@app.get("/health/ollama")
+
+@app.get(
+    "/health/ollama",
+    summary="Check LLM server and model availability",
+    response_description="Ollama health, configured model status, and timing info.",
+    tags=["Health"],
+)
 async def ollama_health():
+    """
+    Checks connectivity to the Ollama LLM server and confirms the selected model is available.
+    """
     start = time.perf_counter()
     try:
         data = await asyncio.wait_for(
@@ -88,8 +113,17 @@ async def ollama_health():
     except Exception as e:
         raise HTTPException(status_code=502, detail="Upstream error") from e
 
-@app.post("/ingest", response_model=IngestResponse)
+@app.post(
+    "/ingest",
+    response_model=IngestResponse,
+    summary="Ingest documents into the retrieval database",
+    response_description="Number of text chunks ingested from documents.",
+    tags=["Documents"],
+)
 async def ingest_data(req: IngestRequest):
+    """
+    Ingest Markdown or plain text files from local paths (file or directory). Chunks are indexed for later retrieval.
+    """
     paths = req.paths
     try:
         doc_len = ingest_paths(paths)
@@ -103,11 +137,24 @@ async def ingest_data(req: IngestRequest):
     logger.info(f"Ingested {doc_len} chunks from {paths or settings.docs_dir}")
     return IngestResponse(ingested_chunks=doc_len)
 
-@app.post("/chat")
+@app.post(
+    "/chat",
+    summary="Ask a question over your ingested documents",
+    response_description="LLM answer with supporting source chunks.",
+    tags=["Chat"],
+    # TODO: Add response_model=ChatResponse if model/return matches!
+)
 async def chat(
-    req: ChatRequest, 
-    similarity: float = Query(0.35, ge=0.0, le=1.0, description="Minimum similarity threshold (lower = stricter, 0.25-0.4 typical)")
+    req: ChatRequest,
+    similarity: float = Query(
+        0.35,
+        ge=0.0, le=1.0,
+        description="Minimum similarity threshold for retrieval (lower = stricter match, 0.25-0.4 typical)"
+    )
 ):
+    """
+    Retrieval-augmented question answering: finds the most relevant chunks, sends as context to LLM, and returns the answer with citations.
+    """
     user_question = req.question
     top_k = req.top_k if req.top_k is not None else settings.top_k
     retrieved_chunks = search(user_question, top_k, similarity)
@@ -131,6 +178,7 @@ async def chat(
     try:
         resp = await asyncio.wait_for(_call_chat(), timeout=settings.ollama_timeout)
         answer = resp.get("message", {}).get("content", "")
+        # NOTE: If you want the docs to show this shape, create and use a ChatResponse model here!
         return {
             "answer": answer,
             "sources": [
@@ -147,12 +195,23 @@ async def chat(
     except (httpx.HTTPStatusError, ValueError, KeyError, TypeError) as e:
         raise HTTPException(status_code=502, detail="Upstream error") from e
 
-@app.get("/debug-search")
+@app.get(
+    "/debug-search",
+    summary="Debug: Retrieve raw chunks (no LLM)",
+    response_description="List of matching chunks for a query.",
+    tags=["Debug"],
+)
 def debug_search(
     q: str = Query(..., description="Search query string", min_length=1),
     k: int = Query(4, description="Number of top results to return", ge=1, le=20),
-    similarity: float = Query(0.35, ge=0.0, le=1.0, description="Minimum similarity threshold (lower = stricter, 0.25-0.4 typical)")
+    similarity: float = Query(
+        0.35, ge=0.0, le=1.0,
+        description="Minimum similarity threshold (lower = stricter, 0.25-0.4 typical)"
+    )
 ):
+    """
+    Directly query the retrieval database to see which chunks would be retrieved for a given string.
+    """
     results = search(q, k, similarity)
     logger.info(f"Debug-search: q='{q}', k={k}, similarity={similarity}, matches={len(results)}")
     return {
@@ -167,9 +226,19 @@ def debug_search(
         "count": len(results)
     }
 
-@app.get("/debug-ingest")
+@app.get(
+    "/debug-ingest",
+    summary="Debug: Show random sample chunks",
+    response_description="List of sample chunks and their count.",
+    tags=["Debug"],
+)
 def debug_ingest(
-    n: int = Query(10, ge=1, le=50, description="Number of sample chunks to show")
+    n: int = Query(
+        10, ge=1, le=50, description="Number of sample chunks to show (1-50)"
+    )
 ):
+    """
+    Returns up to `n` random text chunks from the ingestion database.
+    """
     out = get_sample_chunks(n)
     return {"chunks": out, "count": len(out)}

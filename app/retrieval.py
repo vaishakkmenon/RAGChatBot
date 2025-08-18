@@ -7,7 +7,6 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 
 logger = logging.getLogger(__name__)
 
-
 # Instantiate the embedding function singleton
 _embed = SentenceTransformerEmbeddingFunction(settings.embed_model)
 
@@ -24,6 +23,14 @@ _collection = _client.get_or_create_collection(
 )
 
 def add_documents(docs: List[dict]) -> None:
+    """
+    Add a list of document dicts to the persistent Chroma collection.
+    
+    Each document should contain:
+        - id (str): unique chunk identifier
+        - text (str): content for embedding/search
+        - source (str): original file path
+    """
     if not docs:
         return
     _collection.add(
@@ -32,15 +39,30 @@ def add_documents(docs: List[dict]) -> None:
         metadatas=[{"source": d["source"]} for d in docs],
     )
 
-def search(query: str, k: Optional[int] = None, min_score: float = 0.35) -> List[dict]:
-    k = k or settings.top_k
+def search(
+    query: str, 
+    k: Optional[int] = None, 
+    min_score: float = 0.35
+) -> List[dict]:
+    """
+    Retrieve top-k most similar document chunks to the query.
     
+    Args:
+        query (str): Search string.
+        k (int, optional): Number of results to return. Defaults to settings.top_k.
+        min_score (float): Minimum similarity threshold (lower is stricter, e.g. 0.25-0.4).
+    
+    Returns:
+        List[dict]: Matching chunks with id, text, source, and distance.
+    """
+    k = k or settings.top_k
+
     res = _collection.query(query_texts=[query], n_results=k, include=["distances"]) or {}
     docs = (res.get("documents") or [[]])[0]
     ids = (res.get("ids") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
     dists = (res.get("distances") or [[]])[0]
-    
+
     out = []
     for i, t, m, d in zip(ids, docs, metas, dists):
         if d <= min_score:
@@ -48,7 +70,16 @@ def search(query: str, k: Optional[int] = None, min_score: float = 0.35) -> List
     logger.info(f"Search '{query}': {len(out)}/{k} results above min_score {min_score}")
     return out
 
-def get_sample_chunks(n=10):
+def get_sample_chunks(n: int = 10) -> List[dict]:
+    """
+    Get a sample of document chunks from the collection for debugging or inspection.
+    
+    Args:
+        n (int): Number of random sample chunks to return (default 10).
+    
+    Returns:
+        List[dict]: Each dict includes 'id', 'source', and a preview of 'text' (max 120 chars).
+    """
     res = _collection.get(limit=n)
     ids = res.get("ids") or []
     metadatas = res.get("metadatas") or []
