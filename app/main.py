@@ -4,11 +4,13 @@ import socket
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from .settings import settings
 from .ingest import ingest_paths
 from .retrieval import search, get_sample_chunks
+from .middleware.api_key import APIKeyMiddleware
 from .middleware.logging import LoggingMiddleware
 from .middleware.max_size import MaxSizeMiddleware
 from .metrics import rag_retrieval_chunks, rag_llm_request_total, rag_llm_latency_seconds
@@ -36,8 +38,17 @@ app = FastAPI(
     version="0.2.1",
     summary="Self-hosted RAG chatbot using Ollama, SentenceTransformers, and ChromaDB."
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 app.add_middleware(LoggingMiddleware)
 app.add_middleware(MaxSizeMiddleware, max_bytes=MAX_BYTES)
+app.add_middleware(APIKeyMiddleware)
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 @app.get(
