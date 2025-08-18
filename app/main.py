@@ -1,8 +1,7 @@
-import os, asyncio, time
-import ollama
-import socket
-import httpx
+import os, asyncio, time, ollama, socket, httpx, logging, json
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -23,7 +22,6 @@ from .models import (
     ChatSource,
 )
 
-import logging
 logger = logging.getLogger(__name__)
 
 _CLIENT = ollama.Client(host=settings.ollama_host)
@@ -163,6 +161,7 @@ async def ingest_data(req: IngestRequest):
 @app.post(
     "/chat",
     response_model=ChatResponse,
+    responses={200: {"content": {"application/json": {}, "text/event-stream": {}}}},
     summary="Ask a question over your ingested documents",
     response_description="LLM answer with supporting source chunks.",
     tags=["Chat"],
@@ -177,31 +176,118 @@ async def chat(
             "Lower = closer match, higher = looser match. "
             "Typical values: 0.5-0.8 for cosine distance."
         )
-    )
+    ),
+    stream: bool = Query(False, description="If true, stream tokens via SSE."),
 ):
     """
     Retrieval-augmented question answering: finds the most relevant chunks,
     sends as context to LLM, and returns the answer with citations.
+
+    - Default: returns a JSON ChatResponse (non-streaming).
+    - If `stream=true`: streams Server-Sent Events (SSE) with tokens and a final done event.
     """
     user_question = req.question
     top_k = req.top_k if req.top_k is not None else settings.top_k
     retrieved_chunks = search(user_question, top_k, max_distance)
     rag_retrieval_chunks.observe(len(retrieved_chunks))
 
-    numbered_context = []
-    for i, match in enumerate(retrieved_chunks, start=1):
-        numbered_context.append(f"[{i}] {match['source']}\n{match['text']}")
-    context = "\n\n".join(numbered_context)
+    numbered = []
+    for i, m in enumerate(retrieved_chunks, start=1):
+        numbered.append(f"[{i}] {m['source']}\n{m['text']}")
+    context = "\n\n".join(numbered)
 
+    sources_payload = [
+        {
+            "index": i,
+            "id": m["id"],
+            "source": m["source"],
+            "filename": Path(m["source"]).name,
+            "text": m["text"],
+        }
+        for i, m in enumerate(retrieved_chunks, start=1)
+    ]
+    
+    refs = "\n".join(f"[{s['index']}] {Path(s['source']).name}" for s in sources_payload)
     llm_prompt = (
         "You are a concise assistant. Answer the question using ONLY the information below.\n"
         "Cite sources in your answer using the reference numbers like [1], [2]. "
+        "List the exact filenames (not paths) from the provided sources.\n"
         "If the answer is not contained in the context, say you do not know.\n\n"
+        f"References (use these numbers):\n{refs}\n\n"
         f"Context:\n{context}\n\n"
         f"Question: {user_question}\n\n"
         "Answer:"
     )
 
+    # --- Streaming path (SSE) ---
+    if stream:
+        def sse():
+            start = time.perf_counter()
+
+            # 1) Send sources immediately so the client can render citations
+            meta = {"type": "meta", "sources": sources_payload}
+            yield f"event: meta\ndata: {json.dumps(meta, ensure_ascii=False)}\n\n"
+
+            try:
+                # 2) Stream tokens from Ollama
+                answer_parts = []
+                buf = []
+
+                for part in _CLIENT.chat(
+                    model=settings.ollama_model,
+                    messages=[{"role": "user", "content": llm_prompt}],
+                    options={"num_ctx": settings.num_ctx},
+                    stream=True,
+                ):
+                    chunk = part.get("message", {}).get("content", "")
+                    if not chunk:
+                        continue
+
+                    # collect for final payload
+                    answer_parts.append(chunk)
+
+                    # coalesce small fragments for UI smoothness
+                    buf.append(chunk)
+                    if len("".join(buf)) >= 64 or "\n" in chunk:
+                        out = "".join(buf); buf.clear()
+                        yield f"data: {json.dumps({'type': 'token', 'content': out}, ensure_ascii=False)}\n\n"
+
+                # flush any remainder
+                if buf:
+                    yield f"data: {json.dumps({'type': 'token', 'content': ''.join(buf)}, ensure_ascii=False)}\n\n"
+
+                # 3) Emit final structured payload (ChatResponse shape)
+                final_payload = {
+                    "answer": "".join(answer_parts),
+                    "sources": [
+                        {"index": s["index"], "id": s["id"], "source": s["source"], "text": s["text"], "filename": s["filename"]}
+                        for s in sources_payload
+                    ],
+                }
+                yield f"event: final\ndata: {json.dumps(final_payload, ensure_ascii=False)}\n\n"
+
+                # 4) Done + metrics
+                elapsed = time.perf_counter() - start
+                rag_llm_latency_seconds.observe(elapsed)
+                rag_llm_request_total.labels(status="ok").inc()
+                yield f"event: done\ndata: {json.dumps({'type':'done','elapsed_ms': int(elapsed*1000)})}\n\n"
+
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
+                    httpx.TransportError, OSError, socket.gaierror, socket.timeout,
+                    ConnectionResetError, BrokenPipeError):
+                rag_llm_request_total.labels(status="error").inc()
+                yield f"event: error\ndata: {json.dumps({'type':'error','message':'Ollama unreachable'})}\n\n"
+            except (httpx.HTTPStatusError, ValueError, KeyError, TypeError):
+                rag_llm_request_total.labels(status="error").inc()
+                yield f"event: error\ndata: {json.dumps({'type':'error','message':'Upstream error'})}\n\n"
+
+        headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        return StreamingResponse(sse(), media_type="text/event-stream", headers=headers)
+
+    # --- Non-streaming path (unchanged JSON response) ---
     async def _call_chat():
         return await run_in_threadpool(
             _CLIENT.chat,
@@ -222,13 +308,8 @@ async def chat(
         return ChatResponse(
             answer=answer,
             sources=[
-                ChatSource(
-                    index=i,
-                    id=match["id"],
-                    source=match["source"],
-                    text=match["text"],
-                )
-                for i, match in enumerate(retrieved_chunks, start=1)
+                ChatSource(index=s["index"], id=s["id"], source=s["source"], text=s["text"])
+                for s in sources_payload
             ],
         )
 
@@ -245,6 +326,10 @@ async def chat(
     except (httpx.HTTPStatusError, ValueError, KeyError, TypeError) as e:
         rag_llm_request_total.labels(status="error").inc()
         raise HTTPException(status_code=502, detail="Upstream error") from e
+
+@app.get("/chat/stream")
+async def chat_stream(question: str, max_distance: float = 0.65):
+    return await chat(ChatRequest(question=question), max_distance=max_distance, stream=True)
 
 @app.get(
     "/debug-search",
