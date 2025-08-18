@@ -15,6 +15,7 @@ from app.middleware.max_size import MaxSizeMiddleware
 
 client = TestClient(main.app)
 
+API_HEADERS = {"X-API-Key": settings.api_key}
 
 # --------------------------------------------------------------------
 # Fixture to isolate settings.docs_dir
@@ -49,7 +50,11 @@ def test_chat_happy_path(monkeypatch):
                         lambda **kw: type("", (), {"inc": lambda self: None})())
     monkeypatch.setattr(main.rag_llm_latency_seconds, "observe", lambda v: None)
 
-    resp = client.post("/chat", json={"question":"q"})
+    resp = client.post(
+        "/chat",
+        json={"question": "q"},
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 200
 
 @pytest.mark.parametrize("exc,code", [
@@ -59,11 +64,19 @@ def test_chat_happy_path(monkeypatch):
 def test_chat_error_paths(monkeypatch, exc, code):
     monkeypatch.setattr(main, "search", lambda *a, **k: [])
     monkeypatch.setattr(main.asyncio, "wait_for", lambda coro, timeout: (_ for _ in ()).throw(exc))
-    resp = client.post("/chat", json={"question":"q"})
+    resp = client.post(
+        "/chat",
+        json={"question": "q"},
+        headers=API_HEADERS,
+    )
     assert resp.status_code == code
 
 def test_chat_validation_error():
-    resp = client.post("/chat", json={})
+    resp = client.post(
+        "/chat",
+        json={},
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 422
 
 
@@ -72,16 +85,27 @@ def test_chat_validation_error():
 # --------------------------------------------------------------------
 def test_chat_test_happy(monkeypatch):
     monkeypatch.setattr(_CLIENT, "chat", lambda **kw: DummyResp("test"))
-    resp = client.post("/chat-test", json={"question":"hey"})
+    resp = client.post(
+        "/chat-test",
+        json={"question": "hey"},
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 200
 
 def test_chat_test_validation_error():
-    resp = client.post("/chat-test", json={})
+    resp = client.post(
+        "/chat-test",
+        json={},
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 422
 
 def test_health_ollama_happy(monkeypatch):
     monkeypatch.setattr(_CLIENT, "list", lambda: {"models":[{"name":settings.ollama_model}]})
-    resp = client.get("/health/ollama")
+    resp = client.get(
+        "/health/ollama",
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 200
     data = resp.json()
     assert data["model_ready"] is True
@@ -99,7 +123,11 @@ def test_debug_search_k_boundaries(monkeypatch, k):
         return [{"id": str(i), "source": f"s{i}", "text": f"t{i}"} for i in range(k_)]
     monkeypatch.setattr(main, "search", fake_search)
 
-    resp = client.get("/debug-search", params={"q": "x", "k": k, "max_distance": 0.5})
+    resp = client.get(
+        "/debug-search", 
+        params={"q": "x", "k": k, "max_distance": 0.5},
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 200
 
     body = resp.json()
@@ -115,7 +143,11 @@ def test_debug_search_k_boundaries(monkeypatch, k):
 def test_debug_search_invalid_params(param, val):
     params = {"q": "x", "k": 4, "max_distance": 0.5}
     params[param] = val
-    resp = client.get("/debug-search", params=params)
+    resp = client.get(
+        "/debug-search", 
+        params=params,
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 422
 
 
@@ -125,7 +157,11 @@ def test_debug_search_invalid_params(param, val):
 def test_debug_ingest(monkeypatch):
     # prepare some chunks
     monkeypatch.setattr(main, "get_sample_chunks", lambda n: [f"c{i}" for i in range(n)])
-    resp = client.get("/debug-ingest", params={"n":5})
+    resp = client.get(
+        "/debug-ingest", 
+        params={"n":5},
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 200
     data = resp.json()
     assert data["count"] == 5
@@ -136,7 +172,10 @@ def test_debug_ingest(monkeypatch):
 # 5) /metrics exposition
 # --------------------------------------------------------------------
 def test_metrics_exposition():
-    resp = client.get("/metrics")
+    resp = client.get(
+        "/metrics", 
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 200
     text = resp.text
     assert "rag_retrieval_chunks" in text
@@ -177,7 +216,10 @@ def test_logging_middleware_logs(monkeypatch, capsys):
     handler = StreamHandler(stream)
     monkeypatch.setattr(json_logger, "handlers", [handler])
 
-    resp = client.get("/")
+    resp = client.get(
+        "/", 
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 200
 
     # fetch the single JSON log line
@@ -189,19 +231,31 @@ def test_logging_middleware_logs(monkeypatch, capsys):
 # 8) /ingest error & nested directory + file ingestion
 # --------------------------------------------------------------------
 def test_ingest_not_found():
-    resp = client.post("/ingest", json={"paths":["/no/such"]})
+    resp = client.post(
+        "/ingest", 
+        json={"paths":["/no/such"]},
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 400
 
 def test_ingest_permission(monkeypatch):
     monkeypatch.setattr(main, "ingest_paths",
                         lambda paths: (_ for _ in ()).throw(PermissionError()))
-    resp = client.post("/ingest", json={"paths":["any"]})
+    resp = client.post(
+        "/ingest", 
+        json={"paths":["any"]},
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 403
 
 def test_ingest_generic_error(monkeypatch):
     monkeypatch.setattr(main, "ingest_paths",
                         lambda paths: (_ for _ in ()).throw(ValueError()))
-    resp = client.post("/ingest", json={"paths":["any"]})
+    resp = client.post(
+        "/ingest", 
+        json={"paths":["any"]},
+        headers=API_HEADERS,
+    )
     assert resp.status_code == 500
 
 def test_ingest_nested_and_file(tmp_path):
@@ -211,12 +265,24 @@ def test_ingest_nested_and_file(tmp_path):
     sub.mkdir(parents=True)
     (base / "a.md").write_text("A")
     (sub / "b.txt").write_text("B")
+
     # ingest by directory
-    r1 = client.post("/ingest", json={"paths":[str(base)]})
-    assert r1.status_code == 200 and r1.json()["ingested_chunks"] == 2
+    r1 = client.post(
+        "/ingest",
+        json={"paths": [str(base)]},
+        headers=API_HEADERS,
+    )
+    assert r1.status_code == 200
+    assert r1.json()["ingested_chunks"] == 2
+
     # ingest by file
-    r2 = client.post("/ingest", json={"paths":[str(sub / "b.txt")]})
-    assert r2.status_code == 200 and r2.json()["ingested_chunks"] == 1
+    r2 = client.post(
+        "/ingest",
+        json={"paths": [str(sub / "b.txt")]},
+        headers=API_HEADERS,
+    )
+    assert r2.status_code == 200
+    assert r2.json()["ingested_chunks"] == 1
 
 
 # --------------------------------------------------------------------

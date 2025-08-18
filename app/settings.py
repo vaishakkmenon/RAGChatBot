@@ -29,6 +29,7 @@ class Settings(BaseModel):
 
     chroma_dir: str = os.getenv("CHROMA_DIR", "./data/chroma")
     docs_dir: str = os.getenv("DOCS_DIR", "./data/docs")
+    api_key: str = os.getenv("API_KEY", "")
 
     max_distance: float = float(os.getenv("MAX_DISTANCE", "0.7"))
     top_k: int = int(os.getenv("TOP_K", 4))
