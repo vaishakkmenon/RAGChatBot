@@ -1,3 +1,4 @@
+import random
 import logging
 import chromadb
 from .settings import settings
@@ -80,15 +81,25 @@ def get_sample_chunks(n: int = 10) -> List[dict]:
     Returns:
         List[dict]: Each dict includes 'id', 'source', and a preview of 'text' (max 120 chars).
     """
-    res = _collection.get(limit=n)
+    res = _collection.get()
     ids = res.get("ids") or []
     metadatas = res.get("metadatas") or []
     docs = res.get("documents") or []
-    return [
-        {
+
+    total = len(ids)
+    if total == 0:
+        return []
+
+    sample_indices = random.sample(range(total), k=min(n, total))
+
+    out = []
+    for idx in sample_indices:
+        i = ids[idx]
+        meta = metadatas[idx] if idx < len(metadatas) else {}
+        text = docs[idx] if idx < len(docs) else ""
+        out.append({
             "id": i,
             "source": (meta.get("source") if meta else "unknown"),
-            "text": (text[:120] + ("..." if text and len(text) > 120 else ""))
-        }
-        for i, meta, text in zip(ids, metadatas, docs)
-    ]
+            "text": (text[:120] + ("..." if text and len(text) > 120 else "")),
+        })
+    return out
