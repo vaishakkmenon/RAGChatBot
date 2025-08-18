@@ -1,5 +1,4 @@
-import os
-import logging
+import re, os, logging
 from typing import List, Dict, Optional
 from .retrieval import add_documents
 from .settings import settings
@@ -65,27 +64,70 @@ def find_files(base_paths: List[str]) -> List[str]:
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     """
-    Split text into overlapping chunks for ingestion.
+    Split text into overlapping chunks, preferring natural boundaries (paragraphs/sentences).
     
     Args:
-        text (str): The raw text to chunk.
-        chunk_size (int): Maximum size (in characters) of each chunk.
+        text (str): Raw text to chunk.
+        chunk_size (int): Target maximum size of each chunk (in characters).
         overlap (int): Number of characters to overlap between consecutive chunks.
+    
     Returns:
         list[str]: List of non-empty text chunks.
     """
-    chunks = []
-    i = 0
-    n = len(text)
-    while i < n:
-        j = min(i + chunk_size, n)
-        chunk = text[i:j]
-        if chunk.strip():
-            chunks.append(chunk)
-        if j == n:
-            break
-        i = max(0, j - overlap)
-    return chunks
+    if not text.strip():
+        return []
+
+    # First split into paragraphs, then sentences
+    paragraphs = re.split(r"\n\s*\n", text)
+    units: list[str] = []
+    for para in paragraphs:
+        # Keep paragraph if short, otherwise split by sentences
+        if len(para) <= chunk_size:
+            units.append(para.strip())
+        else:
+            sentences = re.split(r'(?<=[.!?])\s+', para)
+            for s in sentences:
+                if s.strip():
+                    units.append(s.strip())
+
+    # Now pack units into chunks ~chunk_size long
+    chunks: list[str] = []
+    current = ""
+    for unit in units:
+        if not unit:
+            continue
+        if len(current) + len(unit) + 1 <= chunk_size:
+            current = (current + " " + unit).strip()
+        else:
+            if current:
+                chunks.append(current)
+            current = unit
+    if current:
+        chunks.append(current)
+
+    # Apply overlap: re-slice chunks into overlapping windows
+    overlapped: list[str] = []
+    for i, chunk in enumerate(chunks):
+        if not chunk.strip():
+            continue
+        overlapped.append(chunk)
+        # Add overlap with next chunk if possible
+        if i + 1 < len(chunks):
+            combined = chunk[-overlap:] + " " + chunks[i + 1]
+            if combined.strip():
+                overlapped.append(combined.strip())
+
+    # Deduplicate and clean
+    final = []
+    seen = set()
+    for ch in overlapped:
+        ch = ch.strip()
+        if ch and ch not in seen:
+            seen.add(ch)
+            final.append(ch)
+
+    return final
+
 
 def ingest_paths(paths: Optional[List[str]] = None) -> int:
     """
