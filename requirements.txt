@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
+httpx
 chromadb>=0.5.0
 sentence-transformers>=2.2.2
 langgraph>=0.2.0
@@ -9,3 +10,4 @@ ollama>=0.3.0
 datasets
 tqdm
 prometheus-client
+prometheus-fastapi-instrumentator
