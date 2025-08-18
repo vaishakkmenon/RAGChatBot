@@ -38,12 +38,19 @@ app = FastAPI(
     summary="Self-hosted RAG chatbot using Ollama, SentenceTransformers, and ChromaDB."
 )
 
+# Only allow our React front-end on localhost:3000
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
-)
+)  # :contentReference[oaicite:0]{index=0}
+
+# Fail fast if API_KEY isn’t set
+if not settings.api_key:
+    raise RuntimeError(
+        "Missing API_KEY environment variable. Please set API_KEY before starting the application."
+    )
 
 app.add_middleware(LoggingMiddleware)
 app.add_middleware(MaxSizeMiddleware, max_bytes=MAX_BYTES)
