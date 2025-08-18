@@ -1,4 +1,4 @@
-import re, os, logging
+import re, os, logging, hashlib
 from typing import List, Dict, Optional
 from .retrieval import add_documents
 from .settings import settings
@@ -7,6 +7,7 @@ from .metrics import rag_ingested_chunks_total, rag_ingest_skipped_files_total
 
 ALLOWED_EXT = {".txt", ".md"}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB max per file
+BATCH_SIZE = 500
 
 def read_text(path: str) -> str:
     """
@@ -136,6 +137,7 @@ def ingest_paths(paths: Optional[List[str]] = None) -> int:
     """
     Ingests text files from the given paths, chunking them and adding to the retrieval database.
     Skips files that are too large, unreadable, or produce no valid chunks.
+    De-duplicates chunk TEXTS within this ingestion run via SHA-256, and adds to Chroma in batches of 500.
     
     Args:
         paths (Optional[List[str]]): List of file or directory paths to ingest. Defaults to settings.docs_dir if None.
@@ -144,15 +146,21 @@ def ingest_paths(paths: Optional[List[str]] = None) -> int:
     """
     base_paths = paths or [settings.docs_dir]
     files = find_files(base_paths)
-    docs: List[Dict] = []
+
+    docs_batch: List[Dict] = []
+    added_total = 0
+    duplicates_total = 0
+    seen_hashes: set[str] = set()
 
     for fp in files:
+        # stat
         try:
             file_size = os.path.getsize(fp)
         except Exception as e:
             logging.warning(f"Could not stat file {fp}: {e}")
-            continue        
+            continue
 
+        # guards
         if file_size > MAX_FILE_SIZE:
             logging.warning(f"Skipping {fp}: file too large ({file_size} bytes)")
             rag_ingest_skipped_files_total.labels(reason="too_large").inc()
@@ -163,27 +171,59 @@ def ingest_paths(paths: Optional[List[str]] = None) -> int:
             rag_ingest_skipped_files_total.labels(reason="invalid_ext").inc()
             continue
 
+        # read
         try:
             text = read_text(fp)
         except Exception as e:
             logging.warning(f"Could not read {fp}: {e}")
             continue
-        
+
+        # chunk
         chunks = chunk_text(text, settings.chunk_size, settings.chunk_overlap)
         if not chunks:
-            logging.warning(f"File {fp} produced no valid chunks (empty or whitespace).")
+            logging.info(f"{fp}: produced no valid chunks (empty or whitespace).")
             continue
 
-        rag_ingested_chunks_total.inc(len(chunks))
+        # per-file counters
+        file_added = 0
+        file_dupes = 0
 
+        # enqueue chunks with de-duplication
         for idx, ch in enumerate(chunks):
-            docs.append({
-                "id": f"{fp}:{idx}",
-                "text": ch,
-                "source": fp,
-            })
-        logging.info(f"{fp}: {len(chunks)} chunks")
+            # hash on normalized text to catch trivial whitespace dupes
+            norm = ch.strip()
+            if not norm:
+                continue
+            h = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+            if h in seen_hashes:
+                file_dupes += 1
+                duplicates_total += 1
+                logging.info(f"Skipped duplicate chunk {fp}:{idx} (sha256={h[:8]})")
+                continue
 
-    add_documents(docs)
-    logging.info(f"Ingested {len(docs)} chunks from {len(files)} files (skipped files may reduce this count).")
-    return len(docs)
+            seen_hashes.add(h)
+            docs_batch.append({"id": f"{fp}:{idx}", "text": norm, "source": fp})
+            file_added += 1
+
+            # flush batch
+            if len(docs_batch) >= BATCH_SIZE:
+                add_documents(docs_batch)
+                rag_ingested_chunks_total.inc(len(docs_batch))
+                added_total += len(docs_batch)
+                logging.info(f"Added batch of {len(docs_batch)} chunks to Chroma.")
+                docs_batch.clear()
+
+        logging.info(f"{fp}: added {file_added} chunks, skipped {file_dupes} duplicates")
+
+    # flush any remaining
+    if docs_batch:
+        add_documents(docs_batch)
+        rag_ingested_chunks_total.inc(len(docs_batch))
+        added_total += len(docs_batch)
+        logging.info(f"Added final batch of {len(docs_batch)} chunks to Chroma.")
+
+    logging.info(
+        f"Ingest complete: added {added_total} chunks from {len(files)} files; "
+        f"skipped {duplicates_total} duplicate chunks."
+    )
+    return added_total
