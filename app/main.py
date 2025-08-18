@@ -137,6 +137,8 @@ async def ingest_data(req: IngestRequest):
     paths = req.paths
     try:
         doc_len = ingest_paths(paths)
+    except HTTPException:
+        raise
     except FileNotFoundError as e:
         raise HTTPException(status_code=400, detail=f"File not found: {e}")
     except PermissionError as e:

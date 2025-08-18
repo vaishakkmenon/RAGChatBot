@@ -113,8 +113,11 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
             continue
         overlapped.append(chunk)
         # Add overlap with next chunk if possible
-        if i + 1 < len(chunks):
-            combined = chunk[-overlap:] + " " + chunks[i + 1]
+        if overlap > 0 and i + 1 < len(chunks):
+            actual_ov = min(overlap, len(chunk))
+            overlap_text = chunk[-actual_ov:]
+            next_part = chunks[i + 1][: chunk_size - actual_ov]
+            combined = overlap_text + next_part
             if combined.strip():
                 overlapped.append(combined.strip())
 

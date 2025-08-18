@@ -34,3 +34,6 @@ logs/
 
 # Project files
 Rag Chatbot Scaffold.pdf
+
+# Ignore pytest init
+pytest.ini
