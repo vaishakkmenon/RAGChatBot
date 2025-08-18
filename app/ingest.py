@@ -3,6 +3,7 @@ from typing import List, Dict, Optional
 from .retrieval import add_documents
 from .settings import settings
 from fastapi import HTTPException
+from .metrics import rag_ingested_chunks_total, rag_ingest_skipped_files_total
 
 ALLOWED_EXT = {".txt", ".md"}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB max per file
@@ -128,7 +129,6 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
 
     return final
 
-
 def ingest_paths(paths: Optional[List[str]] = None) -> int:
     """
     Ingests text files from the given paths, chunking them and adding to the retrieval database.
@@ -141,15 +141,23 @@ def ingest_paths(paths: Optional[List[str]] = None) -> int:
     """
     base_paths = paths or [settings.docs_dir]
     files = find_files(base_paths)
-    docs: List[Dict] = [] 
+    docs: List[Dict] = []
+
     for fp in files:
         try:
             file_size = os.path.getsize(fp)
         except Exception as e:
             logging.warning(f"Could not stat file {fp}: {e}")
-            continue
+            continue        
+
         if file_size > MAX_FILE_SIZE:
             logging.warning(f"Skipping {fp}: file too large ({file_size} bytes)")
+            rag_ingest_skipped_files_total.labels(reason="too_large").inc()
+            continue
+
+        if os.path.splitext(fp)[1].lower() not in ALLOWED_EXT:
+            logging.warning(f"Skipping {fp}: invalid extension")
+            rag_ingest_skipped_files_total.labels(reason="invalid_ext").inc()
             continue
 
         try:
@@ -162,6 +170,8 @@ def ingest_paths(paths: Optional[List[str]] = None) -> int:
         if not chunks:
             logging.warning(f"File {fp} produced no valid chunks (empty or whitespace).")
             continue
+
+        rag_ingested_chunks_total.inc(len(chunks))
 
         for idx, ch in enumerate(chunks):
             docs.append({

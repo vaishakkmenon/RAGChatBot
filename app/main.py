@@ -6,12 +6,12 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from prometheus_fastapi_instrumentator import Instrumentator
 
-
 from .settings import settings
 from .ingest import ingest_paths
 from .retrieval import search, get_sample_chunks
 from .middleware.logging import LoggingMiddleware
 from .middleware.max_size import MaxSizeMiddleware
+from .metrics import rag_retrieval_chunks, rag_llm_request_total, rag_llm_latency_seconds
 from .models import (
     QuestionRequest,
     IngestRequest,
@@ -167,11 +167,13 @@ async def chat(
     )
 ):
     """
-    Retrieval-augmented question answering: finds the most relevant chunks, sends as context to LLM, and returns the answer with citations.
+    Retrieval-augmented question answering: finds the most relevant chunks,
+    sends as context to LLM, and returns the answer with citations.
     """
     user_question = req.question
     top_k = req.top_k if req.top_k is not None else settings.top_k
     retrieved_chunks = search(user_question, top_k, max_distance)
+    rag_retrieval_chunks.observe(len(retrieved_chunks))
 
     numbered_context = []
     for i, match in enumerate(retrieved_chunks, start=1):
@@ -195,8 +197,14 @@ async def chat(
             options={"num_ctx": settings.num_ctx},
         )
 
+    start = time.perf_counter()
     try:
         resp = await asyncio.wait_for(_call_chat(), timeout=settings.ollama_timeout)
+        elapsed = time.perf_counter() - start
+
+        rag_llm_latency_seconds.observe(elapsed)
+        rag_llm_request_total.labels(status="ok").inc()
+
         answer = resp.get("message", {}).get("content", "")
         return ChatResponse(
             answer=answer,
@@ -210,13 +218,19 @@ async def chat(
                 for i, match in enumerate(retrieved_chunks, start=1)
             ],
         )
+
     except asyncio.TimeoutError:
+        rag_llm_request_total.labels(status="timeout").inc()
         raise HTTPException(status_code=504, detail=f"Upstream timeout after {settings.ollama_timeout}s")
+
     except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
             httpx.TransportError, OSError, socket.gaierror, socket.timeout,
             ConnectionResetError, BrokenPipeError) as e:
+        rag_llm_request_total.labels(status="error").inc()
         raise HTTPException(status_code=503, detail="Ollama unreachable") from e
+
     except (httpx.HTTPStatusError, ValueError, KeyError, TypeError) as e:
+        rag_llm_request_total.labels(status="error").inc()
         raise HTTPException(status_code=502, detail="Upstream error") from e
 
 @app.get(
