@@ -29,7 +29,7 @@ RUN mkdir -p /workspace/data/chroma /workspace/data/docs
 FROM builder AS test
 COPY tests ./tests
 RUN pip install pytest ruff
-CMD ["pytest", "-m", "not integration", "-v"]
+CMD ["/opt/venv/bin/pytest", "-m", "not integration", "-v"]
 
 # ============================
 # Runtime stage
