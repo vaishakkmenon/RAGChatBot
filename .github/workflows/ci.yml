@@ -1,47 +1,26 @@
-# .github/workflows/ci.yml
 name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ main ]
+    branches: [ "main" ]
 
 jobs:
-  test-and-lint:
+  docker-ci:
     runs-on: ubuntu-latest
-
-    env:
-      API_KEY: ${{ secrets.API_KEY }}
-
     steps:
-      - name: Check out code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+      # Build your image with dev tools (pytest + ruff)
+      - name: Build Docker image
+        run: docker build -t ragchatbot:ci .
 
-      - name: Cache pip
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+      # Run tests inside the container
+      - name: Run unit tests
+        run: docker run --rm ragchatbot:ci pytest -m "not integration" -v
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest ruff flake8
-
-      - name: Run tests
-        run: pytest -q
-
-      - name: Lint with ruff
-        run: ruff .
-
-      - name: Lint with flake8
-        run: flake8 .
+      # Run linter inside the container
+      - name: Run linter
+        run: docker run --rm ragchatbot:ci ruff check .
