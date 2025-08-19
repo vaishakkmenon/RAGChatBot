@@ -13,7 +13,7 @@ ENV VENV=/opt/venv PATH="/opt/venv/bin:$PATH"
 WORKDIR /workspace
 RUN python -m venv "$VENV"
 
-# Install prod + dev deps
+# Install prod + dev deps (pytest + ruff included here)
 COPY requirements.txt .
 RUN pip install --upgrade pip wheel setuptools \
     && pip install --no-cache-dir -r requirements.txt \
@@ -23,13 +23,11 @@ RUN pip install --upgrade pip wheel setuptools \
 COPY app ./app
 RUN mkdir -p /workspace/data/chroma /workspace/data/docs
 
+
 # ============================
 # Test stage
 # ============================
 FROM builder AS test
-
-# Install dev/test tools into venv
-RUN /opt/venv/bin/pip install --no-cache-dir pytest ruff
 
 # Copy in tests (not needed in production)
 COPY tests ./tests
@@ -37,6 +35,7 @@ COPY pytest.ini ./
 
 # Default command for test runs
 CMD ["/opt/venv/bin/pytest", "-m", "not integration", "-v"]
+
 
 # ============================
 # Runtime stage
