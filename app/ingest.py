@@ -1,4 +1,7 @@
-import re, os, logging, hashlib
+import os
+import re
+import hashlib
+import logging
 from typing import List, Dict, Optional
 from .retrieval import add_documents
 from .settings import settings

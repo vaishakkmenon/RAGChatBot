@@ -1,6 +1,10 @@
-import json, time, uuid, logging, os, sys
+import json
+import logging
+import os
+import sys
+import time
+import uuid
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 

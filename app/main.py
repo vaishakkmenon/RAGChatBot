@@ -1,4 +1,12 @@
-import os, asyncio, time, ollama, socket, httpx, logging, json
+import asyncio
+import json
+import logging
+import os
+import socket
+import time
+import httpx
+import ollama
+
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -44,7 +52,7 @@ app.add_middleware(
     allow_origins=["http://localhost:3000"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
-)  # :contentReference[oaicite:0]{index=0}
+)
 
 # Fail fast if API_KEY isn’t set
 if not settings.api_key:
@@ -177,7 +185,7 @@ async def ingest_data(req: IngestRequest):
         raise HTTPException(status_code=400, detail=f"File not found: {e}")
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=f"Permission error: {e}")
-    except Exception as e:
+    except Exception:
         logger.exception("Error during ingestion")
         raise HTTPException(status_code=500, detail="Unexpected error during ingestion")
     logger.info(f"Ingested {doc_len} chunks from {paths or settings.docs_dir}")
@@ -203,7 +211,7 @@ async def chat(
     req: ChatRequest,
     max_distance: float = Query(
         0.65,
-        ge=0.0, le=2.0,
+        ge=0.0, le=1.0,
         description=(
             "Maximum vector distance allowed for retrieved chunks. "
             "Lower = closer match, higher = looser match. "
@@ -282,13 +290,14 @@ async def chat(
                     # coalesce small fragments for UI smoothness
                     buf.append(chunk)
                     if len("".join(buf)) >= 64 or "\n" in chunk:
-                        out = "".join(buf); buf.clear()
-                        yield f"data: {json.dumps({'type': 'token', 'content': out}, ensure_ascii=False)}\n\n"
+                        out = "".join(buf)
+                        buf.clear()
+                        yield f"event: token\ndata: {json.dumps({'type': 'token', 'content': out}, ensure_ascii=False)}\n\n"
 
                 # flush any remainder
                 if buf:
-                    yield f"data: {json.dumps({'type': 'token', 'content': ''.join(buf)}, ensure_ascii=False)}\n\n"
-
+                    yield f"event: token\ndata: {json.dumps({'type': 'token', 'content': ''.join(buf)}, ensure_ascii=False)}\n\n"
+                    
                 # 3) Emit final structured payload (ChatResponse shape)
                 final_payload = {
                     "answer": "".join(answer_parts),
@@ -374,7 +383,7 @@ def debug_search(
     q: str = Query(..., description="Search query string", min_length=1),
     k: int = Query(4, description="Number of top results to return", ge=1, le=20),
     max_distance: float = Query(
-        0.65, ge=0.0, le=2.0,
+        0.65, ge=0.0, le=1.0,
         description=(
             "Maximum vector distance allowed for retrieved chunks. "
             "Lower = closer match, higher = looser match."
