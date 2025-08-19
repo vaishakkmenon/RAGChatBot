@@ -33,6 +33,9 @@ RUN /opt/venv/bin/python -m pip install --no-cache-dir pytest==8.4.1 ruff==0.12.
 COPY tests ./tests
 COPY pytest.ini ./
 
+# RESET the base entrypoint so we don't run "python <your-cmd>"
+ENTRYPOINT []
+
 # Run pytest with the venv's interpreter (most reliable)
 CMD ["/opt/venv/bin/python", "-m", "pytest", "-m", "not integration", "-v"]
 
