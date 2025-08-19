@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   docker-ci:
@@ -13,14 +13,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Build your image with dev tools (pytest + ruff)
-      - name: Build Docker image
-        run: docker build -t ragchatbot:ci .
+      # Build the test stage (includes pytest + ruff + tests/)
+      - name: Build test image
+        run: docker build --target test -t ragchatbot:test .
 
-      # Run tests inside the container
+      # Run unit tests (default CMD in test stage already runs pytest -m "not integration")
       - name: Run unit tests
-        run: docker run --rm ragchatbot:ci pytest -m "not integration" -v
+        run: docker run --rm ragchatbot:test
 
-      # Run linter inside the container
+      # Run linter inside the test image
       - name: Run linter
-        run: docker run --rm ragchatbot:ci ruff check .
+        run: docker run --rm ragchatbot:test ruff check .

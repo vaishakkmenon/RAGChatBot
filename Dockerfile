@@ -23,6 +23,13 @@ RUN pip install --upgrade pip wheel setuptools \
 COPY app ./app
 RUN mkdir -p /workspace/data/chroma /workspace/data/docs
 
+# ============================
+# Test stage
+# ============================
+FROM builder AS test
+COPY tests ./tests
+RUN pip install pytest ruff
+CMD ["pytest", "-m", "not integration", "-v"]
 
 # ============================
 # Runtime stage
