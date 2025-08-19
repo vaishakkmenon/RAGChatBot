@@ -8,34 +8,33 @@ RUN install -d -o nonroot -g nonroot /opt/venv \
     && mkdir -p /workspace && chown -R nonroot:nonroot /workspace
 USER nonroot
 
-# Virtualenv for all deps
 ENV VENV=/opt/venv PATH="/opt/venv/bin:$PATH"
 WORKDIR /workspace
 RUN python -m venv "$VENV"
 
-# Install prod + dev deps (pytest + ruff included here)
+# Install ONLY production deps here (keep it clean)
 COPY requirements.txt .
-RUN pip install --upgrade pip wheel setuptools \
-    && pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir pytest ruff
+RUN /opt/venv/bin/python -m pip install --upgrade pip wheel setuptools \
+    && /opt/venv/bin/python -m pip install --no-cache-dir -r requirements.txt
 
-# Copy source
+# Copy app code
 COPY app ./app
 RUN mkdir -p /workspace/data/chroma /workspace/data/docs
-
 
 # ============================
 # Test stage
 # ============================
 FROM builder AS test
 
-# Copy in tests (not needed in production)
+# Ensure dev tools are installed into THE SAME venv used to run tests
+RUN /opt/venv/bin/python -m pip install --no-cache-dir pytest==8.4.1 ruff==0.12.9
+
+# Bring tests and pytest.ini into the image
 COPY tests ./tests
 COPY pytest.ini ./
 
-# Default command for test runs
-CMD ["/opt/venv/bin/pytest", "-m", "not integration", "-v"]
-
+# Run pytest with the venv's interpreter (most reliable)
+CMD ["/opt/venv/bin/python", "-m", "pytest", "-m", "not integration", "-v"]
 
 # ============================
 # Runtime stage
@@ -45,13 +44,11 @@ FROM cgr.dev/chainguard/python:latest
 ENV VENV=/opt/venv PATH="/opt/venv/bin:$PATH"
 WORKDIR /workspace
 
-# Bring in the venv from builder (includes pytest + ruff for CI)
+# Bring in the venv with ONLY prod deps from builder
 COPY --from=builder /opt/venv /opt/venv
-
 # Copy app code only
 COPY --chown=nonroot:nonroot app ./app
-USER nonroot
 
-# Start the server by default
+USER nonroot
 ENTRYPOINT []
 CMD ["/opt/venv/bin/uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--reload"]
