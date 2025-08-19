@@ -1,13 +1,27 @@
-fastapi
-uvicorn[standard]
-httpx
-chromadb>=0.5.0
-sentence-transformers>=2.2.2
-langgraph>=0.2.0
-pydantic>=2
-python-dotenv
-ollama>=0.3.0
-datasets
-tqdm
-prometheus-client
-prometheus-fastapi-instrumentator
+# --- API & server ---
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+uvloop==0.21.0
+httptools==0.6.4
+websockets==13.1
+httpx==0.28.1
+
+# --- RAG stack ---
+chromadb==1.0.20
+sentence-transformers==5.1.0
+langgraph==0.6.5
+ollama==0.5.3
+
+# --- Core ML deps (pin for reproducibility) ---
+torch==2.5.0
+transformers==4.55.2
+
+# --- Data / utils ---
+datasets==4.0.0
+tqdm==4.67.1
+pydantic==2.11.7
+python-dotenv==1.1.1
+
+# --- Metrics ---
+prometheus-client==0.22.1
+prometheus-fastapi-instrumentator==7.1.0
