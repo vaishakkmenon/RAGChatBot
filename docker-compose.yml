@@ -8,6 +8,8 @@ services:
       - "8000:8000"
     environment:
       - WATCHFILES_FORCE_POLLING=1
+      - HF_HOME=/home/nonroot/.cache/huggingface
+      - TRANSFORMERS_CACHE=/home/nonroot/.cache/huggingface
     env_file:
       - .env
     volumes:

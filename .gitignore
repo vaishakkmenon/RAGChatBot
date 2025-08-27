@@ -26,6 +26,7 @@ hf_cache/
 
 # Docs (if not sharing actual docs, otherwise skip this block)
 data/docs/*
+data/squad-v2/
 !data/docs/hello.md
 
 # Logs (optional)

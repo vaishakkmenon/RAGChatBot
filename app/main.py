@@ -41,8 +41,8 @@ MAX_BYTES = settings.max_bytes
 
 app = FastAPI(
     title="RAGChatBot (Local $0)",
-    description="A fully local Retrieval-Augmented Generation chatbot. Ingest local docs and query them using Ollama LLM and ChromaDB, with source citation and tight OpenAPI docs.",
-    version="0.2.1",
+    description="A fully local Retrieval-Augmented Generation chatbot using Ollama LLM and ChromaDB, with source citation and tight OpenAPI docs.",
+    version="0.2.2",
     summary="Self-hosted RAG chatbot using Ollama, SentenceTransformers, and ChromaDB."
 )
 
@@ -50,159 +50,152 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
-    allow_methods=["GET", "POST"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Fail fast if API_KEY isn’t set
-if not settings.api_key:
-    raise RuntimeError(
-        "Missing API_KEY environment variable. Please set API_KEY before starting the application."
-    )
-
-app.add_middleware(LoggingMiddleware)
-app.add_middleware(MaxSizeMiddleware, max_bytes=MAX_BYTES)
+# API key enforcement
 app.add_middleware(APIKeyMiddleware)
-Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+# Request size limit for uploads
+app.add_middleware(MaxSizeMiddleware, max_bytes=MAX_BYTES)
+# Structured JSON logging
+app.add_middleware(LoggingMiddleware)
 
-@app.get(
-    "/",
-    summary="Health and available endpoints",
-    response_description="API status and supported endpoints.",
-    tags=["Health"],
+# Prometheus metrics
+Instrumentator().instrument(app).expose(app)
+
+# --- RAG helper functions: retrieval gating, de-duplication, keyword filter, and prompt building ---
+import hashlib, re
+
+SMALL_TALK = {"hi", "hello", "hey", "thanks", "thank you", "yo", "sup"}
+CITATION_RE = re.compile(r"\s*\[\d+\]")
+
+
+def should_retrieve(q: str) -> bool:
+    q = (q or "").strip().lower()
+    if len(q.split()) <= 3:
+        return False
+    if q in SMALL_TALK or any(q.startswith(w) for w in ("hi", "hello", "hey")):
+        return False
+    return True
+
+def _dedupe_chunks(chunks: list[dict]) -> list[dict]:
+    seen = set()
+    out = []
+    for m in chunks:
+        key = (m.get("source",""), hashlib.sha256(m.get("text","").strip().encode("utf-8")).hexdigest())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(m)
+    return out
+
+def _keyword_filter(chunks: list[dict], query: str) -> list[dict]:
+    """Keep chunks that match strong query terms; if RAG terms appear in the query,
+    require at least one of them in the chunk text."""
+    q = (query or "").lower()
+    strong_terms = {"rag", "retrieval", "augmented", "generation"}
+    text_terms = {t for t in strong_terms if t in q}
+    if text_terms:
+        filtered = [c for c in chunks if any(t in c.get("text","").lower() for t in text_terms)]
+        return filtered or chunks
+    # fallback: previous lightweight filter on longer tokens (>=4 chars) but NOT common stopwords
+    import re
+    toks = [t.lower() for t in re.findall(r"[A-Za-z0-9]+", q) if len(t) >= 4]
+    STOP = {"this","that","with","from","your","about","into","over","under","which","have","will","been","they","their","there","these","those","where","when","what","want","need","like","just","make","take","give","work","good","more","some","such","also","very","even","than","them","then","here","only","much","many","most","each","other","into","upon","after","before","because"}
+    toks = [t for t in toks if t not in STOP]
+    if not toks:
+        return chunks
+    filtered = [c for c in chunks if sum(t in c.get("text","").lower() for t in toks) >= 2]
+    return filtered or chunks
+
+STRICT_SYS_PROMPT = (
+    "EXTRACTIVE MODE. Answer ONLY by copying text spans verbatim from the Context below. "
+    "Do NOT rephrase, summarize, or add any words that are not present in the Context. "
+    "If the Context does not explicitly contain the answer, reply exactly: I don't know."
 )
-def root():
-    """Returns API status and available endpoints."""
-    return {"ok": True, "message": "Hello from RAGChatBot"}
 
-@app.post(
-    "/chat-test",
-    summary="Quick LLM test (no retrieval)",
-    response_description="Direct LLM answer for a test prompt.",
-    tags=["LLM"],
-    responses={
-        400: {"model": ErrorResponse},
-        403: {"model": ErrorResponse},
-        413: {"model": ErrorResponse},
-        502: {"model": ErrorResponse},
-        503: {"model": ErrorResponse},
-        504: {"model": ErrorResponse},
-    },
+SYS_PROMPT = (
+    "You are a helpful RAG assistant. If relevant sources are provided, use them to ground your answer. "
+    "Prefer concise, direct answers. Do not add bracketed citation markers like [1] unless the user explicitly asks for citations. "
+    "If sources are not relevant, answer briefly without fabricating citations."
 )
-async def chat_test(req: QuestionRequest):
-    """
-    Test prompt for direct LLM connection. Does **not** use retrieval/augmentation.
-    """
-    prompt = req.question
-    start = time.perf_counter()
 
-    async def _call_chat():
-        return await run_in_threadpool(
-            _CLIENT.chat,
-            model=_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={"num_ctx": _NUM_CTX},
-        )
+def _format_sources(chunks: list[dict]) -> str:
+    if not chunks:
+        return ""
+    lines = []
+    for i, c in enumerate(chunks, start=1):
+        try:
+            lines.append(f"[{i}] {Path(c['source']).name}\n{c['text']}")
+        except Exception:
+            lines.append(f"[{i}] {c.get('source','unknown')}\n{c.get('text','')}")
+    return "\n\n".join(lines)
 
+def build_messages(question: str, chunks: list[dict], strict: bool = False) -> list[dict]:
+    sys_prompt = STRICT_SYS_PROMPT if strict else SYS_PROMPT
+    user = f"Question: {question.strip()}\n"
+    ctx = _format_sources(chunks)
+    if ctx:
+        user += f"\nContext:\n{ctx}\n\nFollow the system instructions precisely."
+    else:
+        user += "\nNo external context provided."
+    return [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user},
+    ]
+
+@app.get("/health/ollama")
+async def health_ollama():
+    t0 = time.time()
+    ok = False
+    model_ready = False
     try:
-        resp = await asyncio.wait_for(_call_chat(), timeout=REQUEST_TIMEOUT_S)
-        answer = resp.get("message", {}).get("content", "")
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        return {"ok": True, "answer": answer, "elapsed_ms": elapsed_ms}
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail=f"Upstream timeout after {REQUEST_TIMEOUT_S}s")
-    except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
-            httpx.TransportError, OSError, socket.gaierror, socket.timeout,
-            ConnectionResetError, BrokenPipeError) as e:
-        raise HTTPException(status_code=503, detail="Ollama unreachable") from e
-    except (httpx.HTTPStatusError, ValueError, KeyError, TypeError) as e:
-        raise HTTPException(status_code=502, detail="Upstream error") from e
+        _ = _CLIENT.list()
+        ok = True
 
-@app.get(
-    "/health/ollama",
-    summary="Check LLM server and model availability",
-    response_description="Ollama health, configured model status, and timing info.",
-    tags=["Health"],
-)
-async def ollama_health():
-    """
-    Checks connectivity to the Ollama LLM server and confirms the selected model is available.
-    """
-    start = time.perf_counter()
-    try:
-        data = await asyncio.wait_for(
-            run_in_threadpool(lambda: _CLIENT.list()),
-            timeout=REQUEST_TIMEOUT_S
-        )
-        models = data.get("models", []) if isinstance(data, dict) else []
-        model_ready = any(isinstance(m, dict) and m.get("name") == _MODEL for m in models)
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        return {
-            "ok": True,
-            "host": os.getenv("OLLAMA_HOST", ""),
-            "model": _MODEL,
-            "model_ready": bool(model_ready),
-            "num_ctx": _NUM_CTX,
-            "elapsed_ms": elapsed_ms,
-        }
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail=f"Upstream timeout after {REQUEST_TIMEOUT_S}s")
-    except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
-            httpx.TransportError, OSError, socket.gaierror, socket.timeout,
-            ConnectionResetError, BrokenPipeError) as e:
-        raise HTTPException(status_code=503, detail="Ollama unreachable") from e
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail="Upstream error") from e
-    except Exception as e:
-        raise HTTPException(status_code=502, detail="Upstream error") from e
+        try:
+            _CLIENT.show(settings.ollama_model)
+            _CLIENT.chat(
+                model=settings.ollama_model,
+                messages=[{"role": "user", "content": "ping"}],
+                options={"num_ctx": settings.num_ctx, "num_predict": 1},
+            )
+            model_ready = True
+        except Exception:
+            model_ready = False
+
+    except Exception:
+        ok = False
+
+    return {
+        "ok": ok,
+        "host": settings.ollama_host,
+        "model": settings.ollama_model,
+        "model_ready": model_ready,
+        "num_ctx": settings.num_ctx,
+        "elapsed_ms": int((time.time() - t0) * 1000),
+    }
 
 @app.post(
     "/ingest",
     response_model=IngestResponse,
-    summary="Ingest documents into the retrieval database",
-    response_description="Number of text chunks ingested from documents.",
-    tags=["Documents"],
-    responses={
-        400: {"model": ErrorResponse},
-        403: {"model": ErrorResponse},
-        413: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
-        502: {"model": ErrorResponse},
-        503: {"model": ErrorResponse},
-        504: {"model": ErrorResponse},
-    },
+    summary="Ingest .md and .txt files into the vector store",
 )
-async def ingest_data(req: IngestRequest):
-    """
-    Ingest Markdown or plain text files from local paths (file or directory). Chunks are indexed for later retrieval.
-    """
-    paths = req.paths
+async def ingest(req: IngestRequest):
     try:
-        doc_len = ingest_paths(paths)
+        added = await run_in_threadpool(ingest_paths, req.paths)
+        return IngestResponse(ingested_chunks=added)
     except HTTPException:
         raise
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=400, detail=f"File not found: {e}")
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=f"Permission error: {e}")
-    except Exception:
-        logger.exception("Error during ingestion")
-        raise HTTPException(status_code=500, detail="Unexpected error during ingestion")
-    logger.info(f"Ingested {doc_len} chunks from {paths or settings.docs_dir}")
-    return IngestResponse(ingested_chunks=doc_len)
+    except Exception as e:
+        logger.exception("Ingest failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post(
     "/chat",
     response_model=ChatResponse,
-    responses={
-        200: {"content": {"application/json": {}, "text/event-stream": {}}},
-        400: {"model": ErrorResponse},
-        403: {"model": ErrorResponse},
-        413: {"model": ErrorResponse},
-        502: {"model": ErrorResponse},
-        503: {"model": ErrorResponse},
-        504: {"model": ErrorResponse},
-    },
     summary="Ask a question over your ingested documents",
     response_description="LLM answer with supporting source chunks.",
     tags=["Chat"],
@@ -210,15 +203,17 @@ async def ingest_data(req: IngestRequest):
 async def chat(
     req: ChatRequest,
     max_distance: float = Query(
-        0.65,
+        0.45,
         ge=0.0, le=1.0,
         description=(
             "Maximum vector distance allowed for retrieved chunks. "
             "Lower = closer match, higher = looser match. "
-            "Typical values: 0.5-0.8 for cosine distance."
+            "Typical values: 0.35–0.50 for cosine distance."
         )
     ),
     stream: bool = Query(False, description="If true, stream tokens via SSE."),
+    grounded_only: bool = Query(False, description="If true, use only provided sources; otherwise say 'I don't know.'"),
+    temperature: float = Query(0.2, ge=0.0, le=1.5, description="Sampling temperature for the model"),
 ):
     """
     Retrieval-augmented question answering: finds the most relevant chunks,
@@ -229,36 +224,29 @@ async def chat(
     """
     user_question = req.question
     top_k = req.top_k if req.top_k is not None else settings.top_k
-    retrieved_chunks = search(user_question, top_k, max_distance)
-    rag_retrieval_chunks.observe(len(retrieved_chunks))
 
-    numbered = []
-    for i, m in enumerate(retrieved_chunks, start=1):
-        numbered.append(f"[{i}] {m['source']}\n{m['text']}")
-    context = "\n\n".join(numbered)
+    do_retrieve = should_retrieve(user_question)
+    retrieved_chunks = search(user_question, top_k, max_distance) if do_retrieve else []
+    retrieved_chunks = _dedupe_chunks(retrieved_chunks)
+    retrieved_chunks = _keyword_filter(retrieved_chunks, user_question)
+    
+    if grounded_only and not retrieved_chunks:
+        return ChatResponse(answer="I don't know.", sources=[])
+    
+    rag_retrieval_chunks.observe(len(retrieved_chunks))
 
     sources_payload = [
         {
             "index": i,
             "id": m["id"],
             "source": m["source"],
-            "filename": Path(m["source"]).name,
+            "filename": Path(m["source"]).name if isinstance(m.get("source"), str) else "unknown",
             "text": m["text"],
         }
         for i, m in enumerate(retrieved_chunks, start=1)
     ]
-    
-    refs = "\n".join(f"[{s['index']}] {Path(s['source']).name}" for s in sources_payload)
-    llm_prompt = (
-        "You are a concise assistant. Answer the question using ONLY the information below.\n"
-        "Cite sources in your answer using the reference numbers like [1], [2]. "
-        "List the exact filenames (not paths) from the provided sources.\n"
-        "If the answer is not contained in the context, say you do not know.\n\n"
-        f"References (use these numbers):\n{refs}\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {user_question}\n\n"
-        "Answer:"
-    )
+
+    messages = build_messages(user_question, retrieved_chunks, strict=grounded_only)
 
     # --- Streaming path (SSE) ---
     if stream:
@@ -270,14 +258,13 @@ async def chat(
             yield f"event: meta\ndata: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
             try:
-                # 2) Stream tokens from Ollama
-                answer_parts = []
+                # 2) Stream tokens
                 buf = []
-
+                answer_parts = []
                 for part in _CLIENT.chat(
                     model=settings.ollama_model,
-                    messages=[{"role": "user", "content": llm_prompt}],
-                    options={"num_ctx": settings.num_ctx},
+                    messages=messages,
+                    options={"num_ctx": settings.num_ctx, "temperature": temperature, "top_p": 0},
                     stream=True,
                 ):
                     chunk = part.get("message", {}).get("content", "")
@@ -292,15 +279,18 @@ async def chat(
                     if len("".join(buf)) >= 64 or "\n" in chunk:
                         out = "".join(buf)
                         buf.clear()
-                        yield f"event: token\ndata: {json.dumps({'type': 'token', 'content': out}, ensure_ascii=False)}\n\n"
+                        yield f"event: token\ndata: {{\"type\": \"token\", \"content\": {json.dumps(out, ensure_ascii=False)} }}\n\n"
 
-                # flush any remainder
+                # 3) flush tail
                 if buf:
-                    yield f"event: token\ndata: {json.dumps({'type': 'token', 'content': ''.join(buf)}, ensure_ascii=False)}\n\n"
-                    
-                # 3) Emit final structured payload (ChatResponse shape)
+                    out = "".join(buf)
+                    buf.clear()
+                    yield f"event: token\ndata: {{\"type\": \"token\", \"content\": {json.dumps(out, ensure_ascii=False)} }}\n\n"
+
+                # 4) Emit final structured payload (ChatResponse shape)
+                final_answer = CITATION_RE.sub("", "".join(answer_parts))
                 final_payload = {
-                    "answer": "".join(answer_parts),
+                    "answer": final_answer,
                     "sources": [
                         {"index": s["index"], "id": s["id"], "source": s["source"], "text": s["text"], "filename": s["filename"]}
                         for s in sources_payload
@@ -308,7 +298,7 @@ async def chat(
                 }
                 yield f"event: final\ndata: {json.dumps(final_payload, ensure_ascii=False)}\n\n"
 
-                # 4) Done + metrics
+                # 5) Done + metrics
                 elapsed = time.perf_counter() - start
                 rag_llm_latency_seconds.observe(elapsed)
                 rag_llm_request_total.labels(status="ok").inc()
@@ -329,26 +319,26 @@ async def chat(
         }
         return StreamingResponse(sse(), media_type="text/event-stream", headers=headers)
 
-    # --- Non-streaming path (unchanged JSON response) ---
-    async def _call_chat():
-        return await run_in_threadpool(
-            _CLIENT.chat,
-            model=settings.ollama_model,
-            messages=[{"role": "user", "content": llm_prompt}],
-            options={"num_ctx": settings.num_ctx},
-        )
-
-    start = time.perf_counter()
+    # --- Non-streaming path ---
     try:
-        resp = await asyncio.wait_for(_call_chat(), timeout=settings.ollama_timeout)
-        elapsed = time.perf_counter() - start
+        t0 = time.perf_counter()
+        async def _call_chat():
+            return await run_in_threadpool(
+                _CLIENT.chat,
+                model=settings.ollama_model,
+                messages=messages,
+                options={"num_ctx": settings.num_ctx, "temperature": temperature, "top_p": 0},
+            )
 
+        resp = await asyncio.wait_for(_call_chat(), timeout=REQUEST_TIMEOUT_S)
+        elapsed = time.perf_counter() - t0
         rag_llm_latency_seconds.observe(elapsed)
         rag_llm_request_total.labels(status="ok").inc()
 
-        answer = resp.get("message", {}).get("content", "")
+        answer_text = (resp.get("message", {}) or {}).get("content", "").strip()
+        answer_text = CITATION_RE.sub("", answer_text)
         return ChatResponse(
-            answer=answer,
+            answer=answer_text,
             sources=[
                 ChatSource(index=s["index"], id=s["id"], source=s["source"], text=s["text"])
                 for s in sources_payload
@@ -363,63 +353,18 @@ async def chat(
             httpx.TransportError, OSError, socket.gaierror, socket.timeout,
             ConnectionResetError, BrokenPipeError) as e:
         rag_llm_request_total.labels(status="error").inc()
-        raise HTTPException(status_code=503, detail="Ollama unreachable") from e
+        raise HTTPException(status_code=503, detail="Ollama unreachable")
 
     except (httpx.HTTPStatusError, ValueError, KeyError, TypeError) as e:
         rag_llm_request_total.labels(status="error").inc()
-        raise HTTPException(status_code=502, detail="Upstream error") from e
+        raise HTTPException(status_code=502, detail="Upstream error")
 
-@app.get("/chat/stream")
-async def chat_stream(question: str, max_distance: float = 0.65):
-    return await chat(ChatRequest(question=question), max_distance=max_distance, stream=True)
+# --- Debug route to preview retrieval (non-LLM) ---
+@app.get("/debug/search")
+async def debug_search(q: str, k: int = 5, max_distance: float = 0.45):
+    return search(q, k, max_distance)
 
-@app.get(
-    "/debug-search",
-    summary="Debug: Retrieve raw chunks (no LLM)",
-    response_description="List of matching chunks for a query.",
-    tags=["Debug"],
-)
-def debug_search(
-    q: str = Query(..., description="Search query string", min_length=1),
-    k: int = Query(4, description="Number of top results to return", ge=1, le=20),
-    max_distance: float = Query(
-        0.65, ge=0.0, le=1.0,
-        description=(
-            "Maximum vector distance allowed for retrieved chunks. "
-            "Lower = closer match, higher = looser match."
-        )
-    )
-):
-    """
-    Directly query the retrieval database to see which chunks would be retrieved for a given string.
-    """
-    results = search(q, k, max_distance)
-    logger.info(f"Debug-search: q='{q}', k={k}, distance={max_distance}, matches={len(results)}")
-    return {
-        "matches": [
-            {
-                "id": r["id"],
-                "source": r["source"],
-                "text": r["text"][:200] + ("..." if len(r["text"]) > 200 else "")
-            }
-            for r in results
-        ],
-        "count": len(results)
-    }
-
-@app.get(
-    "/debug-ingest",
-    summary="Debug: Show random sample chunks",
-    response_description="List of sample chunks and their count.",
-    tags=["Debug"],
-)
-def debug_ingest(
-    n: int = Query(
-        10, ge=1, le=50, description="Number of sample chunks to show (1-50)"
-    )
-):
-    """
-    Returns up to `n` random text chunks from the ingestion database.
-    """
-    out = get_sample_chunks(n)
-    return {"chunks": out, "count": len(out)}
+# --- Sample chunks (for UI demos) ---
+@app.get("/debug/samples")
+async def debug_samples(n: int = 4):
+    return get_sample_chunks(n)
