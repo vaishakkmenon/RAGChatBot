@@ -42,7 +42,7 @@ def _get(name: str, default: str) -> str:
     return default
 
 EMBED_MODEL: str = _get("embed_model", "BAAI/bge-small-en-v1.5")
-CHROMA_PATH: str = _get("chroma_path", "/workspace/data/chroma")
+CHROMA_PATH: str = _get("chroma_dir", "./data/chroma")
 COLLECTION_NAME: str = _get("collection_name", "rag_docs")
 TOP_K_DEFAULT: int = int(_get("top_k", "4"))
 MAX_DISTANCE_DEFAULT: float = float(_get("max_distance", "0.45"))
