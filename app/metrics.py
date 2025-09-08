@@ -22,13 +22,9 @@ rag_retrieval_chunks = Histogram(
 
 # LLM metrics
 rag_llm_request_total = Counter(
-    "rag_llm_request_total",
-    "Total number of LLM requests by status",
-    ["status"]  # label: ok, timeout, error
+    "rag_llm_request_total", "Total /chat LLM requests", ["status", "model"]
 )
-
 rag_llm_latency_seconds = Histogram(
-    "rag_llm_latency_seconds",
-    "Latency of LLM responses in seconds",
-    buckets=[0.25, 0.5, 1, 2, 5, 10, 30]
+    "rag_llm_latency_seconds", "LLM latency (s)", ["status", "model"],
+    buckets=(0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60)
 )
