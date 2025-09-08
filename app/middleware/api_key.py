@@ -10,12 +10,9 @@ from ..settings import settings
 
 log = logging.getLogger(__name__)
 
-# Public routes that must work without a key (so /docs doesn’t 500)
+# Allow health/docs/openapi and metrics to be scraped without a key
 EXEMPT_PATH_PREFIXES: tuple[str, ...] = (
-    "/docs",
-    "/redoc",
-    "/openapi.json",
-    "/favicon.ico",
+    "/health", "/docs", "/openapi.json", "/metrics", "/redoc", "/favicon.ico"
 )
 
 API_KEY: str | None = getattr(settings, "api_key", None)
