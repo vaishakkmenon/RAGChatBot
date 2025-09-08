@@ -9,7 +9,8 @@ services:
     environment:
       - WATCHFILES_FORCE_POLLING=1
       - HF_HOME=/home/nonroot/.cache/huggingface
-      - TRANSFORMERS_CACHE=/home/nonroot/.cache/huggingface
+      - OLLAMA_HOST=http://ollama:11434
+      - UVICORN_WORKERS=2
     env_file:
       - .env
     volumes:
@@ -25,6 +26,9 @@ services:
     tmpfs:
       - /tmp
     user: "65532:65532"
+    command: ["/opt/venv/bin/python", "-m", "uvicorn", "app.main:app",
+              "--host", "0.0.0.0", "--port", "8000",
+              "--workers", "${UVICORN_WORKERS:-2}"]
     healthcheck:
       test: ["CMD", "/opt/venv/bin/python","-c","import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8000)); print('ok')"]
       interval: 30s
@@ -35,10 +39,21 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: ragchatbot_ollama
-    ports:
-      - "11434:11434"           # optional: exposes Ollama to your host
+    # --- GPU enablement (Compose v2) ---
+    gpus: all
+    # For older setups, also works:
+    # runtime: nvidia
+    environment:
+      - OLLAMA_HOST=http://0.0.0.0:11434
+      - OLLAMA_NUM_PARALLEL=1         # keep 1 while evaluating; raise later if needed
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_LLM_LIBRARY=cublas     # prefer CUDA (GPU) instead of CPU
+      - NVIDIA_VISIBLE_DEVICES=all    # belt-and-suspenders
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
     restart: unless-stopped
 
 volumes:
