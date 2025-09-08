@@ -26,7 +26,7 @@ class Settings(BaseModel):
     num_ctx: int = int(os.getenv("NUM_CTX", 2048))
     ollama_timeout: int = int(os.getenv("OLLAMA_TIMEOUT", 60))
     max_bytes: int = int(os.getenv("MAX_BYTES", 32768))
-
+    num_predict: int = int(os.getenv("NUM_PREDICT", 48))
     chroma_dir: str = os.getenv("CHROMA_DIR", "./data/chroma")
     docs_dir: str = os.getenv("DOCS_DIR", "./data/docs")
     api_key: str = os.getenv("API_KEY", "")
@@ -35,6 +35,7 @@ class Settings(BaseModel):
     top_k: int = int(os.getenv("TOP_K", 4))
     chunk_size: int = int(os.getenv("CHUNK_SIZE", 600))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", 120))
+    null_threshold: float = float(os.getenv("NULL_THRESHOLD", "0.55"))
     embed_model: str = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
 settings = Settings()

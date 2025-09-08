@@ -4,12 +4,11 @@ import logging
 import os
 import socket
 import time
-import httpx
 import ollama
+import re
+import string
 
-from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -20,7 +19,11 @@ from .retrieval import search, get_sample_chunks
 from .middleware.api_key import APIKeyMiddleware
 from .middleware.logging import LoggingMiddleware
 from .middleware.max_size import MaxSizeMiddleware
-from .metrics import rag_retrieval_chunks, rag_llm_request_total, rag_llm_latency_seconds
+from .metrics import (
+    rag_retrieval_chunks,
+    rag_llm_request_total,
+    rag_llm_latency_seconds,
+)
 from .models import (
     QuestionRequest,
     IngestRequest,
@@ -29,24 +32,58 @@ from .models import (
     ChatResponse,
     ChatSource,
     ErrorResponse,
+    RCRequest,
 )
 
 logger = logging.getLogger(__name__)
 
+# --- Ollama client & core settings ---
 _CLIENT = ollama.Client(host=settings.ollama_host)
 _MODEL = settings.ollama_model
 _NUM_CTX = settings.num_ctx
 REQUEST_TIMEOUT_S = settings.ollama_timeout
 MAX_BYTES = settings.max_bytes
 
-app = FastAPI(
-    title="RAGChatBot (Local $0)",
-    description="A fully local Retrieval-Augmented Generation chatbot using Ollama LLM and ChromaDB, with source citation and tight OpenAPI docs.",
-    version="0.2.2",
-    summary="Self-hosted RAG chatbot using Ollama, SentenceTransformers, and ChromaDB."
+# --- RC behavior toggles (env-driven; keep centralized semantics in settings if you add them later) ---
+RC_WINDOW_PAD = int(os.getenv("RC_WINDOW_PAD", "48"))           # IMPORTANT: local refine window size
+RC_ALWAYS_SHRINK = os.getenv("RC_ALWAYS_SHRINK", "true").lower() == "true"
+RC_USE_NEAREST_WORD = os.getenv("RC_USE_NEAREST_WORD", "false").lower() == "true"
+RC_USE_TYPE_HINTS = os.getenv("RC_USE_TYPE_HINTS", "false").lower() == "true"
+
+# --- System prompts (stable; keep short to reduce token overhead) ---
+RC_JSON_SYS_PROMPT = (
+    "You are an EXTRACTIVE QA tool. Given a question and a context string, "
+    "return the SHORTEST contiguous substring of the context that answers the question. "
+    "If the context does not explicitly contain the answer, mark it unanswerable.\n"
+    "Respond with JSON ONLY (no prose) in exactly this shape:\n"
+    '{ "answerable": true|false, "start": <int>, "end": <int> }\n'
+    "- Indices are 0-based character offsets into the EXACT context string.\n"
+    "- If answerable=false, omit start/end or set both to -1.\n"
+    "- Among valid answers, choose the one with the FEWEST characters.\n"
 )
 
-# Only allow our React front-end on localhost:3000
+REFINE_SYS = (
+    "You are a STRICT extractor. Given a question and ONLY the provided text, "
+    "return the SHORTEST answer span indices within the text.\n"
+    'Respond with JSON ONLY: {"start": int, "end": int} (0-based, within the given text). '
+    "If NO answer exists within the given text, set start=-1 and end=-1."
+)
+
+CHAT_SYS_PROMPT = (
+    "Answer with the SHORTEST phrase copied verbatim from the provided context. "
+    "Do NOT add citations, brackets, or commentary. "
+    "If the answer is not explicitly in the context, reply exactly: I don't know."
+)
+
+# --- FastAPI app & middleware wiring ---
+app = FastAPI(
+    title="RAGChatBot (Local $0)",
+    description="Self-hosted RAG chatbot using Ollama, SentenceTransformers, and ChromaDB.",
+    version="0.3.0",
+    summary="Local RAG + SQuAD-v2-style RC.",
+)
+
+# CORS for local frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -55,316 +92,524 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API key enforcement
+# API key, request-size limit, and structured logging
 app.add_middleware(APIKeyMiddleware)
-# Request size limit for uploads
 app.add_middleware(MaxSizeMiddleware, max_bytes=MAX_BYTES)
-# Structured JSON logging
 app.add_middleware(LoggingMiddleware)
 
-# Prometheus metrics
+# Prometheus /metrics
 Instrumentator().instrument(app).expose(app)
 
-# --- RAG helper functions: retrieval gating, de-duplication, keyword filter, and prompt building ---
-import hashlib, re
 
-SMALL_TALK = {"hi", "hello", "hey", "thanks", "thank you", "yo", "sup"}
-CITATION_RE = re.compile(r"\s*\[\d+\]")
+# ========== Helpers (RC + answer verification) ==========
+
+def _contains_word(s: str) -> bool:
+    """True if the string has at least one alphanumeric character."""
+    return any(ch.isalnum() for ch in (s or ""))
 
 
-def should_retrieve(q: str) -> bool:
-    q = (q or "").strip().lower()
-    if len(q.split()) <= 3:
-        return False
-    if q in SMALL_TALK or any(q.startswith(w) for w in ("hi", "hello", "hey")):
-        return False
-    return True
+def _snap_to_word_boundaries(text: str, start: int, end: int) -> tuple[int, int]:
+    """
+    Clamp to [0, len], expand if mid-token, trim whitespace,
+    trim simple leading quotes/brackets, and trim trailing punctuation.
+    Keep a trailing '.' if it looks like part of an acronym.
+    """
+    n = len(text)
+    start = max(0, min(start, n))
+    end = max(0, min(end, n))
+    if end < start:
+        start, end = end, start
 
-def _dedupe_chunks(chunks: list[dict]) -> list[dict]:
-    seen = set()
-    out = []
-    for m in chunks:
-        key = (m.get("source",""), hashlib.sha256(m.get("text","").strip().encode("utf-8")).hexdigest())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(m)
-    return out
+    # Expand if cutting words
+    while start > 0 and start < n and text[start - 1].isalnum() and text[start].isalnum():
+        start -= 1
+    while end < n and end > 0 and text[end - 1].isalnum() and text[end].isalnum():
+        end += 1
 
-def _keyword_filter(chunks: list[dict], query: str) -> list[dict]:
-    """Keep chunks that match strong query terms; if RAG terms appear in the query,
-    require at least one of them in the chunk text."""
-    q = (query or "").lower()
-    strong_terms = {"rag", "retrieval", "augmented", "generation"}
-    text_terms = {t for t in strong_terms if t in q}
-    if text_terms:
-        filtered = [c for c in chunks if any(t in c.get("text","").lower() for t in text_terms)]
-        return filtered or chunks
-    # fallback: previous lightweight filter on longer tokens (>=4 chars) but NOT common stopwords
-    import re
-    toks = [t.lower() for t in re.findall(r"[A-Za-z0-9]+", q) if len(t) >= 4]
-    STOP = {"this","that","with","from","your","about","into","over","under","which","have","will","been","they","their","there","these","those","where","when","what","want","need","like","just","make","take","give","work","good","more","some","such","also","very","even","than","them","then","here","only","much","many","most","each","other","into","upon","after","before","because"}
-    toks = [t for t in toks if t not in STOP]
-    if not toks:
-        return chunks
-    filtered = [c for c in chunks if sum(t in c.get("text","").lower() for t in toks) >= 2]
-    return filtered or chunks
+    # Trim whitespace
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
 
-STRICT_SYS_PROMPT = (
-    "EXTRACTIVE MODE. Answer ONLY by copying text spans verbatim from the Context below. "
-    "Do NOT rephrase, summarize, or add any words that are not present in the Context. "
-    "If the Context does not explicitly contain the answer, reply exactly: I don't know."
-)
+    # Trim simple leading quotes/brackets
+    while start < end and text[start] in "\"'“”‘’([{":
+        start += 1
 
-SYS_PROMPT = (
-    "You are a helpful RAG assistant. If relevant sources are provided, use them to ground your answer. "
-    "Prefer concise, direct answers. Do not add bracketed citation markers like [1] unless the user explicitly asks for citations. "
-    "If sources are not relevant, answer briefly without fabricating citations."
-)
+    # Trim trailing punctuation (common marks)
+    while end > start and text[end - 1] in ",;:!?":
+        end -= 1
 
-def _format_sources(chunks: list[dict]) -> str:
-    if not chunks:
-        return ""
-    lines = []
-    for i, c in enumerate(chunks, start=1):
-        try:
-            lines.append(f"[{i}] {Path(c['source']).name}\n{c['text']}")
-        except Exception:
-            lines.append(f"[{i}] {c.get('source','unknown')}\n{c.get('text','')}")
-    return "\n\n".join(lines)
+    # Handle trailing '.'
+    if end > start and text[end - 1] == '.':
+        span_wo_last = text[start:end - 1]
+        if '.' not in span_wo_last:
+            end -= 1
 
-def build_messages(question: str, chunks: list[dict], strict: bool = False) -> list[dict]:
-    sys_prompt = STRICT_SYS_PROMPT if strict else SYS_PROMPT
-    user = f"Question: {question.strip()}\n"
-    ctx = _format_sources(chunks)
-    if ctx:
-        user += f"\nContext:\n{ctx}\n\nFollow the system instructions precisely."
-    else:
-        user += "\nNo external context provided."
-    return [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user},
+    return start, end
+
+
+def _refine_span(question: str, text: str) -> tuple[int, int]:
+    """
+    Ask the model for a start/end span inside `text`.
+    Returns (-1, -1) if unanswerable or if parsing fails.
+    """
+    messages = [
+        {"role": "system", "content": REFINE_SYS},
+        {
+            "role": "user",
+            "content": (
+                f"Question:\n{question}\n\n"
+                f"Text (index within THIS text):\n{text}\n\n"
+                f"Return JSON ONLY."
+            ),
+        },
     ]
+    resp = _CLIENT.chat(
+        model=_MODEL,
+        messages=messages,
+        format="json",
+        options={"num_ctx": _NUM_CTX, "temperature": 0.0, "top_p": 0},
+    )
+    raw = (resp.get("message", {}) or {}).get("content", "").strip()
 
-@app.get("/health/ollama")
-async def health_ollama():
-    t0 = time.time()
-    ok = False
-    model_ready = False
     try:
-        _ = _CLIENT.list()
-        ok = True
-
-        try:
-            _CLIENT.show(settings.ollama_model)
-            _CLIENT.chat(
-                model=settings.ollama_model,
-                messages=[{"role": "user", "content": "ping"}],
-                options={"num_ctx": settings.num_ctx, "num_predict": 1},
-            )
-            model_ready = True
-        except Exception:
-            model_ready = False
-
+        d = json.loads(raw)
+        s = int(d.get("start", -1))
+        e = int(d.get("end", -1))
+        if 0 <= s < e <= len(text):
+            return s, e
     except Exception:
-        ok = False
+        pass
+    return -1, -1
 
+
+def _nearest_word(text: str, anchor: int) -> tuple[int | None, int | None]:
+    """Return [start, end) of the closest alphanumeric word near `anchor`."""
+    n = len(text)
+    i = max(0, min(anchor, n))
+
+    # Prefer left of anchor
+    j = i - 1
+    while j >= 0 and not text[j].isalnum():
+        j -= 1
+    if j >= 0:
+        l = j
+        while l - 1 >= 0 and text[l - 1].isalnum():
+            l -= 1
+        r = j + 1
+        while r < n and text[r].isalnum():
+            r += 1
+        return l, r
+
+    # Else right of anchor
+    j = i
+    while j < n and not text[j].isalnum():
+        j += 1
+    if j < n:
+        l = j
+        r = j + 1
+        while r < n and text[r].isalnum():
+            r += 1
+        return l, r
+
+    return None, None
+
+
+# --- Optional type-aware (WHO→PERSON) heuristics, gated by RC_USE_TYPE_HINTS ---
+_PERSON_RE = re.compile(r"^[A-Z][a-z]+(?: [A-Z][a-z]+){0,3}$")
+
+def _infer_answer_type(question: str) -> str | None:
+    q = (question or "").strip().lower()
+    if q.startswith("who") or " who " in q:
+        return "PERSON"
+    return None
+
+
+def _is_person_like(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(_PERSON_RE.match(s))
+
+
+def _person_from_window(text: str, left: int, right: int) -> tuple[int | None, int | None]:
+    n = len(text)
+    L = max(0, left)
+    R = min(n, right)
+    window = text[L:R]
+
+    m = re.search(r"\bby ([A-Z][a-z]+(?: [A-Z][a-z]+){0,3})\b", window)
+    if m:
+        s, e = m.span(1)
+        return L + s, L + e
+
+    center = (L + R) // 2
+    best = None
+    for m in re.finditer(r"\b([A-Z][a-z]+(?: [A-Z][a-z]+){0,3})\b", window):
+        s, e = m.span(1)
+        candL, candR = L + s, L + e
+        dist = abs((candL + candR) // 2 - center)
+        if best is None or dist < best[0]:
+            best = (dist, candL, candR)
+    if best:
+        _, s, e = best
+        return s, e
+    return None, None
+
+
+def _refine_text(question: str, text: str) -> str:
+    """
+    Ask the model for the SHORTEST answer TEXT (not indices) within `text`.
+    Returns "" or "I don't know." if none.
+    """
+    TEXT_SYS = (
+        "You are a STRICT extractor. Given a question and ONLY the provided text, "
+        "return the SHORTEST contiguous substring that answers the question. "
+        "If none exists, reply exactly: I don't know.\n"
+        'Respond with JSON ONLY as {"text": "<answer or I don\'t know>"}'
+    )
+    messages = [
+        {"role": "system", "content": TEXT_SYS},
+        {
+            "role": "user",
+            "content": f"Question:\n{question}\n\nText:\n{text}\n\nReturn JSON ONLY.",
+        },
+    ]
+    resp = _CLIENT.chat(
+        model=_MODEL,
+        messages=messages,
+        format="json",
+        options={"num_ctx": _NUM_CTX, "temperature": 0.0, "top_p": 0},
+    )
+    raw = (resp.get("message", {}) or {}).get("content", "").strip()
+
+    try:
+        ans = (json.loads(raw).get("text") or "").strip()
+    except Exception:
+        m = re.search(r'\{\s*"text"\s*:\s*"(.*?)"\s*\}', raw, re.S)
+        ans = (m.group(1).strip() if m else "")
+    return ans
+
+
+def _find_substring_ci(hay: str, needle: str) -> tuple[int, int] | tuple[None, None]:
+    """Case-insensitive substring find; returns [start,end) if found, else (None, None)."""
+    if not hay or not needle:
+        return None, None
+    ihay = hay.lower()
+    ineedle = needle.lower()
+    k = ihay.find(ineedle)
+    if k == -1:
+        return None, None
+    return k, k + len(needle)
+
+
+# ========== Routes ==========
+
+@app.get("/health")
+async def health():
     return {
-        "ok": ok,
-        "host": settings.ollama_host,
-        "model": settings.ollama_model,
-        "model_ready": model_ready,
-        "num_ctx": settings.num_ctx,
-        "elapsed_ms": int((time.time() - t0) * 1000),
+        "status": "ok",
+        "model": _MODEL,
+        "ollama_host": settings.ollama_host,
+        "socket": socket.gethostname(),
     }
 
-@app.post(
-    "/ingest",
-    response_model=IngestResponse,
-    summary="Ingest .md and .txt files into the vector store",
-)
+
+@app.post("/ingest", response_model=IngestResponse)
 async def ingest(req: IngestRequest):
+    paths = req.paths or [settings.docs_dir]
+    added = ingest_paths(paths)
+    return IngestResponse(ingested_chunks=added)
+
+
+# --- Reading Comprehension (SQuAD-v2-style) ---
+@app.post(
+    "/rc",
+    response_model=ChatResponse,
+    summary="Reading comprehension over provided context (extractive, minimal)",
+)
+async def rc(req: RCRequest, temperature: float = 0.0):
+    ctx = req.context
+    n = len(ctx)
+
+    # IMPORTANT: Timeout + metrics around the LLM call
+    t0 = time.time()
     try:
-        added = await run_in_threadpool(ingest_paths, req.paths)
-        return IngestResponse(ingested_chunks=added)
-    except HTTPException:
-        raise
+        primary = await asyncio.wait_for(
+            run_in_threadpool(
+                _CLIENT.chat,
+                model=_MODEL,
+                messages=[
+                    {"role": "system", "content": RC_JSON_SYS_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Question:\n{req.question}\n\n"
+                            f"Context (index in THIS context):\n{ctx}\n\n"
+                            f"Return JSON ONLY."
+                        ),
+                    },
+                ],
+                format="json",
+                options={"num_ctx": _NUM_CTX, "temperature": temperature, "top_p": 0},
+            ),
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        rag_llm_request_total.labels(status="ok", model=_MODEL).inc()
+        rag_llm_latency_seconds.labels(status="ok", model=_MODEL).observe(time.time() - t0)
+    except asyncio.TimeoutError:
+        rag_llm_request_total.labels(status="timeout", model=_MODEL).inc()
+        rag_llm_latency_seconds.labels(status="timeout", model=_MODEL).observe(time.time() - t0)
+        raise HTTPException(status_code=504, detail="LLM timeout")
     except Exception as e:
-        logger.exception("Ingest failed")
+        rag_llm_request_total.labels(status="error", model=_MODEL).inc()
+        rag_llm_latency_seconds.labels(status="error", model=_MODEL).observe(time.time() - t0)
+        logger.exception("LLM /rc failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post(
-    "/chat",
-    response_model=ChatResponse,
-    summary="Ask a question over your ingested documents",
-    response_description="LLM answer with supporting source chunks.",
-    tags=["Chat"],
-)
+    raw = (primary.get("message", {}) or {}).get("content", "").strip()
+    logger.info(f"[RC] raw: {raw}")
+
+    try:
+        d = json.loads(raw)
+    except Exception:
+        d = {}
+
+    if not d or d.get("answerable") is not True:
+        logger.info("[RC] primary says unanswerable → I don't know.")
+        return ChatResponse(
+            answer="I don't know.",
+            sources=[ChatSource(index=1, id="rc_json::0", source="squad_context", text=ctx)],
+        )
+
+    raw_start = int(d.get("start", -1))
+    raw_end = int(d.get("end", -1))
+    start = max(0, min(raw_start, n))
+    end = max(0, min(raw_end, n))
+    span = ctx[start:end]
+    oob = (raw_start < 0 or raw_end < 0 or raw_start >= raw_end or raw_end > n)
+    logger.info(f"[RC] primary indices: start={start}, end={end}, span='{span}', oob={oob}")
+
+    # Refine WITHIN if long
+    too_long = (len(span) > 24) or (len(span.split()) > 4)
+    if too_long:
+        s2, e2 = _refine_span(req.question, span)
+        logger.info(f"[RC] refine-within returned: s2={s2}, e2={e2}")
+        if 0 <= s2 < e2 <= len(span):
+            start = start + s2
+            end = start + (e2 - s2)
+            span = ctx[start:end]
+            logger.info(f"[RC] after refine-within: start={start}, end={end}, span='{span}'")
+
+    # Refine AROUND if junk
+    junk = (not span) or (not _contains_word(span))
+    if junk:
+        left = max(0, min(start, end) - RC_WINDOW_PAD)
+        right = min(n, max(start, end) + RC_WINDOW_PAD)
+        window = ctx[left:right]
+        s3, e3 = _refine_span(req.question, window)
+        logger.info(f"[RC] refine-around window=[{left},{right}) len={len(window)} → s3={s3}, e3={e3}")
+        if 0 <= s3 < e3 <= len(window):
+            start = left + s3
+            end = left + e3
+            span = ctx[start:end]
+            logger.info(f"[RC] after refine-around: start={start}, end={end}, span='{span}'")
+
+    # Always shrink within local window (general, safe)
+    if RC_ALWAYS_SHRINK:
+        left = max(0, start - RC_WINDOW_PAD)
+        right = min(n, end + RC_WINDOW_PAD)
+        window = ctx[left:right]
+        s5, e5 = _refine_span(req.question, window)
+        logger.info(f"[RC] shrink-window [{left},{right}) -> s5={s5}, e5={e5}")
+        if 0 <= s5 < e5 <= len(window):
+            start = left + s5
+            end = left + e5
+            span = ctx[start:end]
+            logger.info(f"[RC] after shrink-window: start={start}, end={end}, span='{span}'")
+
+    # Snap to word boundaries and optionally fall back to text refinement
+    start, end = _snap_to_word_boundaries(ctx, start, end)
+    span = ctx[start:end].strip()
+    logger.info(f"[RC] after snap: start={start}, end={end}, span='{span}'")
+
+    still_long = (len(span) > 24) or (len(span.split()) > 4)
+    if (not span or not _contains_word(span)) or oob or still_long:
+        L = max(0, start - RC_WINDOW_PAD) if end > start else 0
+        R = min(n, end + RC_WINDOW_PAD) if end > start else n
+        window = ctx[L:R] if (R > L) else ctx
+        ans_text = _refine_text(req.question, window)
+        logger.info(f"[RC] text-fallback → '{ans_text}'")
+        if ans_text and ans_text.lower() not in ("i don't know.", "i don't know"):
+            s_loc, e_loc = _find_substring_ci(window, ans_text)
+            if s_loc is not None and e_loc is not None:
+                start = L + s_loc
+                end = L + e_loc
+                start, end = _snap_to_word_boundaries(ctx, start, end)
+                span = ctx[start:end].strip()
+                logger.info(f"[RC] after text-fallback locate: start={start}, end={end}, span='{span}'")
+
+    # Optional type-aware correction for WHO questions
+    if RC_USE_TYPE_HINTS:
+        atype = _infer_answer_type(req.question)
+        if atype == "PERSON" and not _is_person_like(span):
+            L = max(0, start - 64)
+            R = min(n, end + 64)
+            ps, pe = _person_from_window(ctx, L, R)
+            logger.info(f"[RC] type-hint PERSON search [{L},{R}) → ps={ps}, pe={pe}")
+            if ps is not None and pe is not None:
+                start, end = _snap_to_word_boundaries(ctx, ps, pe)
+                span = ctx[start:end].strip()
+                logger.info(f"[RC] after PERSON snap: start={start}, end={end}, span='{span}'")
+
+    answer = span if (span and _contains_word(span)) else "I don't know."
+    logger.info(f"[RC] FINAL: answer='{answer}' (start={start}, end={end})")
+
+    return ChatResponse(
+        answer=answer,
+        sources=[ChatSource(index=1, id="rc_json::0", source="squad_context", text=ctx)],
+    )
+
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+def _normalize(s: str) -> str:
+    s = s.lower()
+    s = s.translate(str.maketrans({c: " " for c in string.punctuation}))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _answer_in_sources(ans: str, src_texts: list[str]) -> bool:
+    a = _normalize(ans)
+    if not a:
+        return False
+    ctx = _normalize(" ".join(t for t in src_texts if t))
+    return a in ctx
+
+
+def _best_sentence(context: str, question: str) -> str:
+    q = set(_normalize(question).split())
+    best, best_score = "", -1
+    for sent in _SENT_SPLIT.split(context):
+        s = set(_normalize(sent).split())
+        score = len(q & s)  # simple token overlap
+        if score > best_score:
+            best, best_score = sent, score
+    return best
+
+
+def _source_text(s) -> str:
+    if isinstance(s, dict):
+        return s.get("text", "")
+    # Pydantic v2 preferred: attribute access, then model_dump fallback
+    t = getattr(s, "text", None)
+    if t is not None:
+        return t
+    try:
+        return s.model_dump().get("text", "")
+    except Exception:
+        return ""
+
+
+# --- RAG chat with distance-based abstention ---
+@app.post("/chat", response_model=ChatResponse)
 async def chat(
     req: ChatRequest,
-    max_distance: float = Query(
-        0.45,
-        ge=0.0, le=1.0,
-        description=(
-            "Maximum vector distance allowed for retrieved chunks. "
-            "Lower = closer match, higher = looser match. "
-            "Typical values: 0.35–0.50 for cosine distance."
-        )
+    grounded_only: bool = Query(True, description="Abstain when retrieval is weak."),
+    null_threshold: float = Query(
+        settings.null_threshold,
+        ge=0.0,
+        le=1.0,
+        description="Distance above which we say 'I don't know.'",
     ),
-    stream: bool = Query(False, description="If true, stream tokens via SSE."),
-    grounded_only: bool = Query(False, description="If true, use only provided sources; otherwise say 'I don't know.'"),
-    temperature: float = Query(0.2, ge=0.0, le=1.5, description="Sampling temperature for the model"),
+    temperature: float = Query(0.0, ge=0.0, le=1.0),
+    max_distance: float = Query(settings.max_distance, ge=0, le=1),
 ):
-    """
-    Retrieval-augmented question answering: finds the most relevant chunks,
-    sends as context to LLM, and returns the answer with citations.
+    # Retrieve
+    k = max(1, min(20, req.top_k or settings.top_k))
+    chunks = search(req.question, k=k, max_distance=max_distance)
 
-    - Default: returns a JSON ChatResponse (non-streaming).
-    - If `stream=true`: streams Server-Sent Events (SSE) with tokens and a final done event.
-    """
-    user_question = req.question
-    top_k = req.top_k if req.top_k is not None else settings.top_k
+    # IMPORTANT: histogram defined WITHOUT labels → call without .labels(...)
+    rag_retrieval_chunks.observe(len(chunks))
 
-    do_retrieve = should_retrieve(user_question)
-    retrieved_chunks = search(user_question, top_k, max_distance) if do_retrieve else []
-    retrieved_chunks = _dedupe_chunks(retrieved_chunks)
-    retrieved_chunks = _keyword_filter(retrieved_chunks, user_question)
-    
-    if grounded_only and not retrieved_chunks:
+    # Early abstain if retrieval is weak
+    distances = [float(c["distance"]) for c in chunks if c.get("distance") is not None]
+    best_d = min(distances) if distances else None
+    if grounded_only and (not chunks or (best_d is not None and best_d > null_threshold)):
         return ChatResponse(answer="I don't know.", sources=[])
-    
-    rag_retrieval_chunks.observe(len(retrieved_chunks))
 
-    sources_payload = [
+    # Build context + sources
+    ctx_blocks: list[str] = []
+    sources: list[ChatSource] = []
+    for i, c in enumerate(chunks, start=1):
+        text = c.get("text", "") or ""
+        src = c.get("source", "unknown")
+        cid = c.get("id", f"chunk::{i}")
+        ctx_blocks.append(f"[{i}] {text}")
+        sources.append(ChatSource(index=i, id=cid, source=src, text=text))
+    context_str = "\n\n".join(ctx_blocks)
+
+    messages = [
+        {"role": "system", "content": CHAT_SYS_PROMPT},
         {
-            "index": i,
-            "id": m["id"],
-            "source": m["source"],
-            "filename": Path(m["source"]).name if isinstance(m.get("source"), str) else "unknown",
-            "text": m["text"],
-        }
-        for i, m in enumerate(retrieved_chunks, start=1)
+            "role": "user",
+            "content": f"Question:\n{req.question}\n\nUse ONLY the following context if relevant:\n{context_str}",
+        },
     ]
 
-    messages = build_messages(user_question, retrieved_chunks, strict=grounded_only)
-
-    # --- Streaming path (SSE) ---
-    if stream:
-        def sse():
-            start = time.perf_counter()
-
-            # 1) Send sources immediately so the client can render citations
-            meta = {"type": "meta", "sources": sources_payload}
-            yield f"event: meta\ndata: {json.dumps(meta, ensure_ascii=False)}\n\n"
-
-            try:
-                # 2) Stream tokens
-                buf = []
-                answer_parts = []
-                for part in _CLIENT.chat(
-                    model=settings.ollama_model,
-                    messages=messages,
-                    options={"num_ctx": settings.num_ctx, "temperature": temperature, "top_p": 0},
-                    stream=True,
-                ):
-                    chunk = part.get("message", {}).get("content", "")
-                    if not chunk:
-                        continue
-
-                    # collect for final payload
-                    answer_parts.append(chunk)
-
-                    # coalesce small fragments for UI smoothness
-                    buf.append(chunk)
-                    if len("".join(buf)) >= 64 or "\n" in chunk:
-                        out = "".join(buf)
-                        buf.clear()
-                        yield f"event: token\ndata: {{\"type\": \"token\", \"content\": {json.dumps(out, ensure_ascii=False)} }}\n\n"
-
-                # 3) flush tail
-                if buf:
-                    out = "".join(buf)
-                    buf.clear()
-                    yield f"event: token\ndata: {{\"type\": \"token\", \"content\": {json.dumps(out, ensure_ascii=False)} }}\n\n"
-
-                # 4) Emit final structured payload (ChatResponse shape)
-                final_answer = CITATION_RE.sub("", "".join(answer_parts))
-                final_payload = {
-                    "answer": final_answer,
-                    "sources": [
-                        {"index": s["index"], "id": s["id"], "source": s["source"], "text": s["text"], "filename": s["filename"]}
-                        for s in sources_payload
-                    ],
-                }
-                yield f"event: final\ndata: {json.dumps(final_payload, ensure_ascii=False)}\n\n"
-
-                # 5) Done + metrics
-                elapsed = time.perf_counter() - start
-                rag_llm_latency_seconds.observe(elapsed)
-                rag_llm_request_total.labels(status="ok").inc()
-                yield f"event: done\ndata: {json.dumps({'type':'done','elapsed_ms': int(elapsed*1000)})}\n\n"
-
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
-                    httpx.TransportError, OSError, socket.gaierror, socket.timeout,
-                    ConnectionResetError, BrokenPipeError):
-                rag_llm_request_total.labels(status="error").inc()
-                yield f"event: error\ndata: {json.dumps({'type':'error','message':'Ollama unreachable'})}\n\n"
-            except (httpx.HTTPStatusError, ValueError, KeyError, TypeError):
-                rag_llm_request_total.labels(status="error").inc()
-                yield f"event: error\ndata: {json.dumps({'type':'error','message':'Upstream error'})}\n\n"
-
-        headers = {
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
-        return StreamingResponse(sse(), media_type="text/event-stream", headers=headers)
-
-    # --- Non-streaming path ---
+    # IMPORTANT: Timeout + metrics around the LLM call
+    t0 = time.time()
     try:
-        t0 = time.perf_counter()
-        async def _call_chat():
-            return await run_in_threadpool(
+        resp = await asyncio.wait_for(
+            run_in_threadpool(
                 _CLIENT.chat,
-                model=settings.ollama_model,
+                model=_MODEL,
                 messages=messages,
-                options={"num_ctx": settings.num_ctx, "temperature": temperature, "top_p": 0},
-            )
-
-        resp = await asyncio.wait_for(_call_chat(), timeout=REQUEST_TIMEOUT_S)
-        elapsed = time.perf_counter() - t0
-        rag_llm_latency_seconds.observe(elapsed)
-        rag_llm_request_total.labels(status="ok").inc()
-
-        answer_text = (resp.get("message", {}) or {}).get("content", "").strip()
-        answer_text = CITATION_RE.sub("", answer_text)
-        return ChatResponse(
-            answer=answer_text,
-            sources=[
-                ChatSource(index=s["index"], id=s["id"], source=s["source"], text=s["text"])
-                for s in sources_payload
-            ],
+                options={
+                    "num_ctx": _NUM_CTX,
+                    "temperature": temperature,
+                    "top_p": 0,
+                    "num_predict": settings.num_predict,
+                    "stop": ["\n[", "\nUse ONLY", "\nQuestion:", "\nContext:"],
+                },
+            ),
+            timeout=REQUEST_TIMEOUT_S,
         )
-
+        rag_llm_request_total.labels(status="ok", model=_MODEL).inc()
+        rag_llm_latency_seconds.labels(status="ok", model=_MODEL).observe(time.time() - t0)
     except asyncio.TimeoutError:
-        rag_llm_request_total.labels(status="timeout").inc()
-        raise HTTPException(status_code=504, detail=f"Upstream timeout after {settings.ollama_timeout}s")
+        rag_llm_request_total.labels(status="timeout", model=_MODEL).inc()
+        rag_llm_latency_seconds.labels(status="timeout", model=_MODEL).observe(time.time() - t0)
+        raise HTTPException(status_code=504, detail="LLM timeout")
+    except Exception as e:
+        rag_llm_request_total.labels(status="error", model=_MODEL).inc()
+        rag_llm_latency_seconds.labels(status="error", model=_MODEL).observe(time.time() - t0)
+        logger.exception("LLM /chat failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout,
-            httpx.TransportError, OSError, socket.gaierror, socket.timeout,
-            ConnectionResetError, BrokenPipeError) as e:
-        rag_llm_request_total.labels(status="error").inc()
-        raise HTTPException(status_code=503, detail="Ollama unreachable")
+    answer = (resp.get("message", {}) or {}).get("content", "").strip() or "I don't know."
 
-    except (httpx.HTTPStatusError, ValueError, KeyError, TypeError) as e:
-        rag_llm_request_total.labels(status="error").inc()
-        raise HTTPException(status_code=502, detail="Upstream error")
+    # Verify grounding if requested
+    clean = re.sub(r"\[\d+\]", "", answer).strip()
+    if grounded_only:
+        src_texts = [_source_text(s) for s in sources]
+        if not _answer_in_sources(clean, src_texts):
+            clean = "I don't know."
 
-# --- Debug route to preview retrieval (non-LLM) ---
+    # Heuristic sentence check (kept from original behavior)
+    src_texts = [_source_text(s) for s in sources]
+    ctx_joined = " ".join(src_texts)
+    sent = _best_sentence(ctx_joined, req.question)
+    if grounded_only and _normalize(clean) not in _normalize(sent):
+        clean = "I don't know."
+
+    return ChatResponse(answer=clean, sources=sources)
+
+
+# --- Debug routes (unchanged API shapes) ---
 @app.get("/debug/search")
 async def debug_search(q: str, k: int = 5, max_distance: float = 0.45):
     return search(q, k, max_distance)
 
-# --- Sample chunks (for UI demos) ---
 @app.get("/debug/samples")
 async def debug_samples(n: int = 4):
     return get_sample_chunks(n)

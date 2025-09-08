@@ -83,3 +83,7 @@ class ChatResponse(BaseModel):
     
 class ErrorResponse(BaseModel):
     detail: str = Field(..., description="Error detail message")
+    
+class RCRequest(BaseModel):
+    question: str
+    context: str
