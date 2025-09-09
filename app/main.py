@@ -16,6 +16,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from .settings import settings
 from .ingest import ingest_paths
 from .retrieval import search, get_sample_chunks
+from .answering.extractive import generate_extractive
 from .middleware.api_key import APIKeyMiddleware
 from .middleware.logging import LoggingMiddleware
 from .middleware.max_size import MaxSizeMiddleware
@@ -25,13 +26,11 @@ from .metrics import (
     rag_llm_latency_seconds,
 )
 from .models import (
-    QuestionRequest,
     IngestRequest,
     IngestResponse,
     ChatRequest,
     ChatResponse,
     ChatSource,
-    ErrorResponse,
     RCRequest,
 )
 
@@ -508,6 +507,19 @@ def _source_text(s) -> str:
         return s.model_dump().get("text", "")
     except Exception:
         return ""
+    
+def _answer_tokens_subseq(ans: str, src_texts: list[str]) -> bool:
+    a = _normalize(ans).split()
+    if not a:
+        return False
+    ctx_tokens = _normalize(" ".join(t for t in src_texts if t)).split()
+    j = 0
+    for w in ctx_tokens:
+        if j < len(a) and a[j] == w:
+            j += 1
+            if j == len(a):
+                return True
+    return False
 
 
 # --- RAG chat with distance-based abstention ---
@@ -523,6 +535,7 @@ async def chat(
     ),
     temperature: float = Query(0.0, ge=0.0, le=1.0),
     max_distance: float = Query(settings.max_distance, ge=0, le=1),
+    extractive: bool = Query(False, description="Use strict extractive head (copy verbatim)."),
 ):
     # Retrieve
     k = max(1, min(20, req.top_k or settings.top_k))
@@ -548,61 +561,88 @@ async def chat(
         sources.append(ChatSource(index=i, id=cid, source=src, text=text))
     context_str = "\n\n".join(ctx_blocks)
 
-    messages = [
-        {"role": "system", "content": CHAT_SYS_PROMPT},
-        {
-            "role": "user",
-            "content": f"Question:\n{req.question}\n\nUse ONLY the following context if relevant:\n{context_str}",
-        },
-    ]
-
-    # IMPORTANT: Timeout + metrics around the LLM call
+    # === Generate ===
+    answer = "I don't know."  # default
+    raw_generation = None
     t0 = time.time()
     try:
-        resp = await asyncio.wait_for(
-            run_in_threadpool(
-                _CLIENT.chat,
-                model=_MODEL,
-                messages=messages,
-                options={
-                    "num_ctx": _NUM_CTX,
-                    "temperature": temperature,
-                    "top_p": 0,
-                    "num_predict": settings.num_predict,
-                    "stop": ["\n[", "\nUse ONLY", "\nQuestion:", "\nContext:"],
+        if extractive or os.getenv("EXTRACTIVE", "0") == "1":
+            # Extractive path: copy verbatim from passages (use RAW chunk text)
+            passages = [{"id": s.id, "text": s.text} for s in sources]
+            raw_generation, _meta = await generate_extractive(
+                req.question,
+                passages,
+                temperature=temperature,
+            )
+            ans = (raw_generation or "").strip()
+            # Treat explicit model abstain marker as null
+            answer = "I don't know." if ans.upper() == "NOT_IN_CONTEXT" else (ans or "I don't know.")
+        else:
+            # Default generative path
+            messages = [
+                {"role": "system", "content": CHAT_SYS_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question:\n{req.question}\n\n"
+                        f"Use ONLY the following context if relevant:\n{context_str}"
+                    ),
                 },
-            ),
-            timeout=REQUEST_TIMEOUT_S,
-        )
+            ]
+            resp = await asyncio.wait_for(
+                run_in_threadpool(
+                    _CLIENT.chat,
+                    model=_MODEL,
+                    messages=messages,
+                    options={
+                        "num_ctx": _NUM_CTX,
+                        "temperature": temperature,
+                        "top_p": 0,
+                        "num_predict": settings.num_predict,
+                        "stop": ["\n[", "\nUse ONLY", "\nQuestion:", "\nContext:"],
+                    },
+                ),
+                timeout=REQUEST_TIMEOUT_S,
+            )
+            answer = ((resp.get("message") or {}).get("content") or "").strip() or "I don't know."
+
         rag_llm_request_total.labels(status="ok", model=_MODEL).inc()
         rag_llm_latency_seconds.labels(status="ok", model=_MODEL).observe(time.time() - t0)
+
     except asyncio.TimeoutError:
         rag_llm_request_total.labels(status="timeout", model=_MODEL).inc()
         rag_llm_latency_seconds.labels(status="timeout", model=_MODEL).observe(time.time() - t0)
         raise HTTPException(status_code=504, detail="LLM timeout")
+
     except Exception as e:
         rag_llm_request_total.labels(status="error", model=_MODEL).inc()
         rag_llm_latency_seconds.labels(status="error", model=_MODEL).observe(time.time() - t0)
         logger.exception("LLM /chat failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-    answer = (resp.get("message", {}) or {}).get("content", "").strip() or "I don't know."
-
     # Verify grounding if requested
     clean = re.sub(r"\[\d+\]", "", answer).strip()
     if grounded_only:
-        src_texts = [_source_text(s) for s in sources]
-        if not _answer_in_sources(clean, src_texts):
+        src_texts = [s.text for s in sources]
+        ok = _answer_in_sources(clean, src_texts)  # contiguous substring
+        if not ok and (extractive or os.getenv("EXTRACTIVE", "0") == "1"):
+            ok = _answer_tokens_subseq(clean, src_texts)  # allow gaps in extractive
+        if not ok:
             clean = "I don't know."
 
     # Heuristic sentence check (kept from original behavior)
-    src_texts = [_source_text(s) for s in sources]
-    ctx_joined = " ".join(src_texts)
-    sent = _best_sentence(ctx_joined, req.question)
-    if grounded_only and _normalize(clean) not in _normalize(sent):
-        clean = "I don't know."
+    if not (extractive or os.getenv("EXTRACTIVE", "0") == "1"):
+        src_texts = [_source_text(s) for s in sources]
+        ctx_joined = " ".join(src_texts)
+        sent = _best_sentence(ctx_joined, req.question)
+        if grounded_only and _normalize(clean) not in _normalize(sent):
+            clean = "I don't know."
 
-    return ChatResponse(answer=clean, sources=sources)
+    return ChatResponse(
+        answer=clean,
+        sources=sources,
+        raw_generation=raw_generation,
+    )
 
 
 # --- Debug routes (unchanged API shapes) ---

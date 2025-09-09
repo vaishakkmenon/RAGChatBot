@@ -80,6 +80,7 @@ class ChatResponse(BaseModel):
             }
         ]}
     )
+    raw_generation: Optional[str] = None
     
 class ErrorResponse(BaseModel):
     detail: str = Field(..., description="Error detail message")
