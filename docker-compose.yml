@@ -45,7 +45,7 @@ services:
     # runtime: nvidia
     environment:
       - OLLAMA_HOST=http://0.0.0.0:11434
-      - OLLAMA_NUM_PARALLEL=1         # keep 1 while evaluating; raise later if needed
+      - OLLAMA_NUM_PARALLEL=4         # keep 1 while evaluating; raise later if needed
       - OLLAMA_MAX_LOADED_MODELS=1
       - OLLAMA_LLM_LIBRARY=cublas     # prefer CUDA (GPU) instead of CPU
       - NVIDIA_VISIBLE_DEVICES=all    # belt-and-suspenders

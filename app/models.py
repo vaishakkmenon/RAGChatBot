@@ -81,10 +81,18 @@ class ChatResponse(BaseModel):
         ]}
     )
     raw_generation: Optional[str] = None
-    
+    evidence_span: Optional["EvidenceSpan"] = None
+
+class EvidenceSpan(BaseModel):
+    doc_id: str
+    start: int
+    end: int
+    text: str
 class ErrorResponse(BaseModel):
     detail: str = Field(..., description="Error detail message")
     
 class RCRequest(BaseModel):
     question: str
     context: str
+
+ChatResponse.model_rebuild()

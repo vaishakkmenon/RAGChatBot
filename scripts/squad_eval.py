@@ -1,4 +1,4 @@
-# scripts/squad_eval_lite.py
+# scripts/squad_eval.py
 from __future__ import annotations
 import argparse, json, re, time, threading, statistics as stats
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,8 +14,10 @@ IDK_RE = re.compile(
     r"\b("
     r"i\s*(?:do\s*not|don['’]t)\s*know"
     r"|cannot\s+answer|can['’]t\s+answer"
-    r"|not\s+in\s+my\s+knowledge\s+base"
-    r"|unknown|no\s+answer|n/?a"
+    r"|no\s+answer|not\s+sure|unsure|unknown|no\s+information"
+    r"|information\s+not\s+available|insufficient\s+information"
+    r"|answer\s+not\s+found|the\s+context\s+does\s+not\s+contain"
+    r"|not\s+in\s+context"
     r")\b",
     re.I,
 )
@@ -38,12 +40,15 @@ def f1_score(pred: str, golds: List[str]) -> float:
         gt = toks(g)
         if not pt and not gt:
             best = max(best, 1.0); continue
-        common = {}
-        for w in pt: 
-            if w in gt:
-                common[w] = min(pt.count(w), gt.count(w))
-        num_same = sum(common.values())
-        if num_same == 0: 
+        # multiset overlap
+        num_same = 0
+        gt_counts = {}
+        for w in gt: gt_counts[w] = gt_counts.get(w, 0) + 1
+        for w in pt:
+            if gt_counts.get(w, 0) > 0:
+                num_same += 1
+                gt_counts[w] -= 1
+        if num_same == 0:
             score = 0.0
         else:
             prec = num_same / len(pt)
@@ -75,25 +80,47 @@ def session() -> requests.Session:
     s = getattr(_thread_local, "s", None)
     if s is None:
         s = requests.Session()
-        try:
-            from requests.adapters import HTTPAdapter
-            ad = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
-            s.mount("http://", ad); s.mount("https://", ad)
-        except Exception:
-            pass
         _thread_local.s = s
     return s
 
-def call_chat(q: str, host: str, api_key: str, grounded_only: bool, top_k: int,
-              max_distance: float, null_threshold: Optional[float], temperature: float,
-              timeout: float) -> Tuple[str, Optional[int], str]:
-    params = {
+def call_chat(
+    q: str,
+    host: str,
+    api_key: str,
+    grounded_only: bool,
+    top_k: int,
+    max_distance: float,
+    null_threshold: Optional[float],
+    temperature: float,
+    timeout: float,
+    extractive: bool = False,
+    alpha: Optional[float] = None,
+    alpha_hits: Optional[int] = None,
+    support_min: Optional[float] = None,
+    support_window: Optional[int] = None,
+    span_max_distance: Optional[float] = None,
+) -> Tuple[str, Optional[int], str]:
+    params: Dict[str, Any] = {
         "grounded_only": str(grounded_only).lower(),
         "max_distance": max_distance,
         "temperature": temperature,
     }
     if null_threshold is not None:
         params["null_threshold"] = null_threshold
+    if extractive:
+        params["extractive"] = 1
+        # Optional pre-abstain + evidence gates
+        if alpha is not None:
+            params["alpha"] = alpha
+        if alpha_hits is not None:
+            params["alpha_hits"] = alpha_hits
+        if support_min is not None:
+            params["support_min"] = support_min
+        if support_window is not None:
+            params["support_window"] = support_window
+        if span_max_distance is not None:
+            params["span_max_distance"] = span_max_distance
+
     payload = {"question": q, "top_k": top_k}
     headers = {
         "Content-Type": "application/json",
@@ -116,6 +143,18 @@ def main():
     ap.add_argument("--dataset", required=True, help="Path to SQuAD v2 dev JSON")
     ap.add_argument("--host", default="http://127.0.0.1:8000")
     ap.add_argument("--api-key", required=True)
+    ap.add_argument("--extractive", action="store_true",
+                    help="Enable extractive answering (A1+A2) by sending ?extractive=1")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="(extractive only) distance cutoff for extra pre-abstain gate, e.g. 0.55")
+    ap.add_argument("--alpha-hits", type=int, default=None,
+                    help="(extractive only) require at least this many chunks under --alpha (e.g., 1)")
+    ap.add_argument("--support-min", type=float, default=None,
+                    help="(extractive only) min lexical-overlap support around evidence (e.g., 0.35)")
+    ap.add_argument("--support-window", type=int, default=None,
+                    help="(extractive only) half-window size (chars) around evidence for support (e.g., 128)")
+    ap.add_argument("--span-max-distance", type=float, default=None,
+                    help="(extractive only) require the evidence chunk distance ≤ this value (e.g., 0.55)")
     ap.add_argument("--limit", type=int, default=200)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--split", choices=["all","answerable","unanswerable"], default="all")
@@ -129,15 +168,14 @@ def main():
     ap.add_argument("--out", help="Optional path to write JSON summary")
     args = ap.parse_args()
 
-    rows = load_squad_v2(args.dataset)
-    if args.split != "all":
-        want_ans = (args.split == "answerable")
-        rows = [r for r in rows if (not r["is_impossible"]) == want_ans]
-    rows = rows[args.offset: args.offset + args.limit]
+    all_rows = load_squad_v2(args.dataset)
+    # Filter slice & split
+    rows = all_rows[args.offset: args.offset + args.limit] if args.limit else all_rows[args.offset:]
+    if args.split == "answerable":
+        rows = [r for r in rows if not r["is_impossible"]]
+    elif args.split == "unanswerable":
+        rows = [r for r in rows if r["is_impossible"]]
 
-    print(f"Evaluating {len(rows)} examples…")
-
-    # metrics
     em_sum = f1_sum = 0.0
     ans_em = ans_f1 = ans_n = 0.0
     unans_em = unans_f1 = unans_n = 0.0
@@ -147,7 +185,10 @@ def main():
     def work(row: Dict[str, Any]) -> Tuple[float,float,bool,Optional[int],bool]:
         pred, ms, status = call_chat(
             row["question"], args.host, args.api_key, args.grounded_only,
-            args.top_k, args.max_distance, args.null_threshold, args.temperature, args.timeout
+            args.top_k, args.max_distance, args.null_threshold, args.temperature, args.timeout,
+            extractive=args.extractive, alpha=args.alpha, alpha_hits=args.alpha_hits,
+            support_min=args.support_min, support_window=args.support_window,
+            span_max_distance=args.span_max_distance,
         )
         if status != "ok":
             return 0.0, 0.0, row["is_impossible"], None, True
@@ -162,7 +203,7 @@ def main():
         for i, r in enumerate(rows, 1):
             EM, F1, is_unans, ms, err = work(r)
             if err: errors += 1
-            else: 
+            else:
                 em_sum += EM; f1_sum += F1
                 if is_unans: unans_em += EM; unans_f1 += F1; unans_n += 1
                 else:        ans_em += EM;   ans_f1 += F1;   ans_n   += 1
@@ -211,9 +252,12 @@ def main():
                          "NoAns_Accuracy": round(unans_em_avg,4) if unans_em_avg is not None else None},
         "latency": lat_summary,
         "settings": {
-            "host": args.host, "grounded_only": args.grounded_only, "top_k": args.top_k,
+            "host": args.host, "grounded_only": args.grounded_only, "extractive": args.extractive, "top_k": args.top_k,
             "max_distance": args.max_distance, "null_threshold": getattr(args, "null_threshold", None),
             "temperature": args.temperature, "workers": args.workers, "timeout": args.timeout,
+            "alpha": args.alpha, "alpha_hits": args.alpha_hits,
+            "support_min": args.support_min, "support_window": args.support_window,
+            "span_max_distance": args.span_max_distance,
         }
     }
 

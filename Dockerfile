@@ -54,4 +54,4 @@ COPY --chown=nonroot:nonroot app ./app
 
 USER nonroot
 ENTRYPOINT []
-CMD ["/opt/venv/bin/uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--reload"]
+CMD ["/opt/venv/bin/uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--workers","4"]

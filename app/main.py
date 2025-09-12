@@ -8,6 +8,7 @@ import ollama
 import re
 import string
 
+from typing import Optional, Tuple, Sequence, Dict, Any, List
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +33,7 @@ from .models import (
     ChatResponse,
     ChatSource,
     RCRequest,
+    EvidenceSpan,
 )
 
 logger = logging.getLogger(__name__)
@@ -300,6 +302,124 @@ def _find_substring_ci(hay: str, needle: str) -> tuple[int, int] | tuple[None, N
         return None, None
     return k, k + len(needle)
 
+# =========================
+# A2: Deterministic span snapper helpers (pure string ops)
+# =========================
+_WS_RE = re.compile(r"\s+")
+_TOK_RE = re.compile(r"\w+", re.UNICODE)
+
+def _normalize_ws(s: str) -> str:
+    """Collapse all whitespace to single spaces and trim."""
+    return _WS_RE.sub(" ", s).strip()
+
+def _find_span_basic(answer: str, text: str) -> Optional[Tuple[int, int]]:
+    """Try exact, then case-insensitive substring match. Return (start,end) or None."""
+    if not answer:
+        return None
+    # Exact
+    idx = text.find(answer)
+    if idx != -1:
+        return idx, idx + len(answer)
+    # Case-insensitive
+    ans_ci = answer.casefold()
+    txt_ci = text.casefold()
+    idx = txt_ci.find(ans_ci)
+    if idx != -1:
+        return idx, idx + len(answer)
+    return None
+
+def _find_span_subseq(answer: str, text: str) -> Optional[Tuple[int, int]]:
+    """
+    Ordered token subsequence fallback.
+    Tokenize with '\'w+; match tokens in order (case-insensitive).
+    Return a single contiguous char span from first to last token match.
+    """
+    ans_tokens = _TOK_RE.findall(answer)
+    if not ans_tokens:
+        return None
+    ans_tokens_ci = [t.casefold() for t in ans_tokens]
+
+    matches: List[Tuple[int, int]] = []
+    ai = 0
+
+    for m in _TOK_RE.finditer(text):
+        if ai >= len(ans_tokens_ci):
+            break
+        tok = m.group(0).casefold()
+        if tok == ans_tokens_ci[ai]:
+            matches.append((m.start(), m.end()))
+            ai += 1
+            if ai == len(ans_tokens_ci):
+                break
+
+    if ai != len(ans_tokens_ci) or not matches:
+        return None
+
+    start = matches[0][0]
+    end = matches[-1][1]
+    return start, end
+
+def locate_best_span(answer: str, sources: Sequence[ChatSource | Dict[str, Any]]) -> Optional[EvidenceSpan]:
+    """
+    Iterate sources in order; try basic match then subseq. On hit, return EvidenceSpan.
+    Accepts either ChatSource objects or dicts with id/text.
+    """
+    if not answer:
+        return None
+
+    for src in sources:
+        src_id = src.id if isinstance(src, ChatSource) else str(src.get("id", ""))
+        src_text = src.text if isinstance(src, ChatSource) else str(src.get("text", ""))
+        if not src_text:
+            continue
+
+        # 1) exact / ci substring
+        hit = _find_span_basic(answer, src_text)
+        if hit is None:
+            norm_answer = _normalize_ws(answer)
+            if norm_answer != answer:
+                hit = _find_span_basic(norm_answer, src_text)
+
+        # 2) subsequence fallback
+        if hit is None:
+            hit = _find_span_subseq(answer, src_text)
+
+        if hit is not None:
+            s, e = hit
+            if 0 <= s <= e <= len(src_text):
+                return EvidenceSpan(
+                    doc_id=src_id,
+                    start=s,
+                    end=e,
+                    text=src_text[s:e],
+                )
+    return None
+
+# --- Generic safe getter for chunks that might be dicts or SimpleNamespace/Pydantic
+def _gx(obj, key: str, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    val = getattr(obj, key, None)
+    return val if val is not None else default
+
+# --- Tiny stopword set + overlap scoring for support gating
+_STOPWORDS = {
+    "the","a","an","of","to","in","on","at","for","and","or","if","is","are","was","were",
+    "by","with","from","as","that","this","these","those","it","its","be","been","being",
+    "which","who","whom","what","when","where","why","how"
+}
+_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+
+def _tokset(s: str) -> set[str]:
+    return {w.lower() for w in _WORD_RE.findall(s or "") if w.lower() not in _STOPWORDS}
+
+def _overlap_score(question: str, ctx: str) -> float:
+    q = _tokset(question)
+    c = _tokset(ctx)
+    if not q or not c:
+        return 0.0
+    return len(q & c) / max(1, len(q))
+
 
 # ========== Routes ==========
 
@@ -507,20 +627,35 @@ def _source_text(s) -> str:
         return s.model_dump().get("text", "")
     except Exception:
         return ""
-    
-def _answer_tokens_subseq(ans: str, src_texts: list[str]) -> bool:
-    a = _normalize(ans).split()
-    if not a:
-        return False
-    ctx_tokens = _normalize(" ".join(t for t in src_texts if t)).split()
-    j = 0
-    for w in ctx_tokens:
-        if j < len(a) and a[j] == w:
-            j += 1
-            if j == len(a):
-                return True
-    return False
 
+def _extractive_should_abstain(chunks, null_threshold: float | None, alpha: float | None, min_hits: int) -> bool:
+    dists = []
+    for c in chunks:
+        # c may be a dict or SimpleNamespace depending on your code path
+        dist = getattr(c, "distance", None)
+        if dist is None and isinstance(c, dict):
+            dist = c.get("distance")
+        if dist is not None:
+            dists.append(float(dist))
+    if not dists:
+        return True  # nothing retrieved → abstain
+
+    min_dist = min(dists)
+    # Primary rule: use the null_threshold as a min-distance cutoff
+    use_alpha = (alpha is not None and min_hits > 0)
+    hits = sum(1 for d in dists if (alpha is not None and d <= float(alpha))) if use_alpha else None
+
+    # If alpha is provided, require BOTH: min_dist < null_threshold AND hits ≥ min_hits
+    if null_threshold is not None:
+        if use_alpha:
+            return not (min_dist < float(null_threshold) and hits is not None and hits >= min_hits)
+        else:
+            return min_dist >= float(null_threshold)
+    else:
+        # No null_threshold provided; if alpha is given, use only hits criterion
+        if use_alpha:
+            return hits is None or hits < min_hits
+        return False
 
 # --- RAG chat with distance-based abstention ---
 @app.post("/chat", response_model=ChatResponse)
@@ -536,6 +671,12 @@ async def chat(
     temperature: float = Query(0.0, ge=0.0, le=1.0),
     max_distance: float = Query(settings.max_distance, ge=0, le=1),
     extractive: bool = Query(False, description="Use strict extractive head (copy verbatim)."),
+    alpha: float | None = Query(None, ge=0.0, le=1.0, description="Stricter extractive gate cutoff."),
+    alpha_hits: int = Query(1, ge=0, description="Min chunks under alpha."),
+    support_min: float = Query(0.15, ge=0.0, le=1.0, description="Min token-overlap between question and window around evidence (extractive only)."),
+    support_window: int = Query(96, ge=16, le=512, description="Half-window size (chars) around evidence used for support check (extractive only)."),
+    span_max_distance: float | None = Query(None, ge=0.0, le=1.0,
+        description="Max distance allowed for the chunk that contains the evidence span (extractive only).")
 ):
     # Retrieve
     k = max(1, min(20, req.top_k or settings.top_k))
@@ -544,8 +685,14 @@ async def chat(
     # IMPORTANT: histogram defined WITHOUT labels → call without .labels(...)
     rag_retrieval_chunks.observe(len(chunks))
 
-    # Early abstain if retrieval is weak
-    distances = [float(c["distance"]) for c in chunks if c.get("distance") is not None]
+    # Early abstain if retrieval is weak (robust for dict or attr objects)
+    distances = []
+    for c in chunks:
+        d = getattr(c, "distance", None)
+        if d is None and isinstance(c, dict):
+            d = c.get("distance")
+        if d is not None:
+            distances.append(float(d))
     best_d = min(distances) if distances else None
     if grounded_only and (not chunks or (best_d is not None and best_d > null_threshold)):
         return ChatResponse(answer="I don't know.", sources=[])
@@ -554,19 +701,34 @@ async def chat(
     ctx_blocks: list[str] = []
     sources: list[ChatSource] = []
     for i, c in enumerate(chunks, start=1):
-        text = c.get("text", "") or ""
-        src = c.get("source", "unknown")
-        cid = c.get("id", f"chunk::{i}")
+        text = _gx(c, "text", "") or ""
+        src = _gx(c, "source", "unknown") or "unknown"
+        cid = _gx(c, "id", f"chunk::{i}") or f"chunk::{i}"
         ctx_blocks.append(f"[{i}] {text}")
         sources.append(ChatSource(index=i, id=cid, source=src, text=text))
     context_str = "\n\n".join(ctx_blocks)
+    
+    # Extractive-only pre-abstain gate to protect No-Answer accuracy
+    is_extractive = extractive or os.getenv("EXTRACTIVE", "0") == "1"
 
+    # Optional stricter knobs via env; you can also expose as Query params later
+    alpha_env = os.getenv("EX_ALPHA")
+    alpha_eff = alpha if alpha is not None else (float(alpha_env) if alpha_env else None)
+    min_hits_eff = alpha_hits if alpha_hits is not None else int(os.getenv("EX_ALPHA_HITS", "1"))
+    
     # === Generate ===
     answer = "I don't know."  # default
     raw_generation = None
     t0 = time.time()
     try:
-        if extractive or os.getenv("EXTRACTIVE", "0") == "1":
+        if is_extractive:
+            if _extractive_should_abstain(chunks, null_threshold, alpha_eff, min_hits_eff):
+                return ChatResponse(
+                    answer="I don't know.",
+                    sources=sources,
+                    raw_generation="NOT_IN_CONTEXT",
+                    evidence_span=None,
+                )
             # Extractive path: copy verbatim from passages (use RAW chunk text)
             passages = [{"id": s.id, "text": s.text} for s in sources]
             raw_generation, _meta = await generate_extractive(
@@ -622,11 +784,9 @@ async def chat(
 
     # Verify grounding if requested
     clean = re.sub(r"\[\d+\]", "", answer).strip()
-    if grounded_only:
+    if grounded_only and not (extractive or os.getenv("EXTRACTIVE", "0") == "1"):
         src_texts = [s.text for s in sources]
-        ok = _answer_in_sources(clean, src_texts)  # contiguous substring
-        if not ok and (extractive or os.getenv("EXTRACTIVE", "0") == "1"):
-            ok = _answer_tokens_subseq(clean, src_texts)  # allow gaps in extractive
+        ok = _answer_in_sources(clean, src_texts)
         if not ok:
             clean = "I don't know."
 
@@ -638,10 +798,38 @@ async def chat(
         if grounded_only and _normalize(clean) not in _normalize(sent):
             clean = "I don't know."
 
+    # === A2: evidence span (only for extractive answers) ===
+    evidence = None
+    if (extractive or os.getenv("EXTRACTIVE", "0") == "1") and clean != "I don't know.":
+        # 1) pick span
+        evidence = locate_best_span(clean, sources)
+        if evidence is None:
+            clean = "I don't know."
+        else:
+            # 2) distance gate (A2.b)
+            ev_chunk = next((c for c in chunks if _gx(c, "id") == evidence.doc_id), None)
+            ev_dist = float(_gx(ev_chunk, "distance", 1.0)) if ev_chunk is not None else 1.0
+            if span_max_distance is not None and ev_dist > span_max_distance:
+                logger.info("abstain: span_dist_gate ev_dist=%.3f > gate=%.3f doc_id=%s",
+                            ev_dist, span_max_distance, evidence.doc_id)
+                clean = "I don't know."
+                evidence = None
+            else:
+                # 3) support gate
+                src_text = next((s.text for s in sources if s.id == (evidence.doc_id)), "")
+                if src_text:
+                    L = max(0, evidence.start - support_window)
+                    R = min(len(src_text), evidence.end + support_window)
+                    supp = _overlap_score(req.question, src_text[L:R])
+                    if supp < support_min:
+                        clean = "I don't know."
+                        evidence = None
+
     return ChatResponse(
         answer=clean,
         sources=sources,
         raw_generation=raw_generation,
+        evidence_span=evidence,
     )
 
 
