@@ -1,227 +1,222 @@
-# RAGChatBot (Local $0)
+# FastAPI RAG Chatbot (SQuADv2 Demo)
 
-> A **self-hosted, production-style Retrieval-Augmented Generation (RAG) chatbot**.  
-> Ingest local Markdown / text files, index them in **ChromaDB**, and query them using **Ollama** LLM — with citations, streaming, metrics, and hardened APIs.
+A compact Retrieval-Augmented Generation (RAG) chatbot built with FastAPI. It includes health/metrics, ingestion, retrieval + reranker (A3), extractive/generative answerers, evidence span snapping (A2), and abstention gates — with evaluation scripts and tuning grids for SQuADv2.
 
-- **Local-first**: No cloud keys required.
-- **Production-minded**: OpenAPI docs, request size limits, JSON logging, API key auth, Prometheus metrics.
-- **Observable**: `/metrics` for latency and request counts.
-- **Developer-friendly**: Docker-native CI, tests, and a minimal **Streamlit** frontend.
+## Highlights
 
----
+- **Endpoints**: `/health`, `/metrics`, `/ingest`, `/debug/samples`, `/debug/search`, `/rc` (reading-comprehension over given text), `/chat` (full RAG; extractive or generative)
+- **Safety/Calibration**: Early retrieval null-gate, extractive pre-gate (alpha, alpha_hits), span distance/support gates (span_max_distance, support_min/support_window)
+- **Reranker (A3)**: Lexical/semantic blend by default; can switch to hosted or local cross-encoder later
+- **Reproducible evals**: Windows .bat to run sweeps, write JSON summaries, build leaderboards and charts
 
-## ✨ Features
+## Repository Structure
 
-- Document ingestion (`.md`, `.txt`) with chunking + overlap
-- Similarity search (cosine distance) with **max distance** cutoff
-- Chat with **numbered citations** to sources
-- **Streaming** token responses via SSE
-- Prometheus metrics: retrieval counts, LLM latency, request totals
-- Minimal **Streamlit** UI for quick demos
-
----
-
-## 🧱 Stack
-
-**FastAPI** · **Uvicorn** · **Ollama** · **SentenceTransformers** · **ChromaDB** · **Prometheus** · **Streamlit**  
-Container base: **Chainguard Python** (non-root, slim)
-
----
-
-## 🚀 Quick Start (Docker)
-
-### Prerequisites
-- [Docker](https://docs.docker.com/get-docker/)
-- (Optional) [Docker Compose](https://docs.docker.com/compose/)
-
-### 1) Clone & configure
-```bash
-git clone https://github.com/your-org-or-user/ragchatbot.git
-cd ragchatbot
-cp .env.example .env
+```
+.
+├─ main.py                   # FastAPI app: routes, middleware, CORS, metrics
+├─ settings.py               # knobs via environment variables
+├─ retrieval.py              # retrieve + optional rerank
+├─ extractive.py             # span finding, support windows, gates
+├─ ingest.py, models.py, metrics.py, api_key.py, logging.py, max_size.py
+├─ scripts/
+│  ├─ squad_eval.py          # SQuADv2 evaluation with progress + JSON report
+│  ├─ retrieval_eval.py      # retrieval-only metrics
+│  ├─ tune_eval.bat          # sweep + leaderboard builder
+│  └─ build_leaderboards.py  # combine JSONs -> CSV + scatter plot
+├─ data/
+│  └─ squad/dev-v2.0.json    # place SQuADv2 dev set here
+├─ results/
+│  └─ YYYYMMDD_HHMMSS/       # per-run JSONs created by scripts
+└─ docs/
+   ├─ pareto_scatter.png
+   └─ combined_eval_table.csv
 ```
 
-Ensure your `.env` has an API key:
-```env
-API_KEY=dev
+## Quick Start (Windows CMD)
+
+### 1. One-time Environment Setup
+
+```cmd
+set URL=http://127.0.0.1:8000
+set KEY=my-dev-key-1
+set DATASET=%CD%\data\squad\dev-v2.0.json
 ```
 
-### 2) Start the API (compose)
-```bash
-docker compose up -d --build
-# subsequent runs:
-# docker compose up -d
+### 2. Sanity Checks
+
+```cmd
+curl -s "%URL%/health"
+curl -s "%URL%/metrics" | more
 ```
 
-Or build the runtime image directly:
-```bash
-docker build -t ragchatbot:app .
-docker run --rm -p 8000:8000 -e API_KEY=dev ragchatbot:app
+### 3. Optional Ingestion
+
+If your app supports loading documents:
+
+```cmd
+curl -s -X POST "%URL%/ingest" ^
+  -H "X-API-Key: %KEY%" -H "Content-Type: application/json" ^
+  --data-binary "{\"paths\":[]}"
 ```
 
-### 3) Verify
-```bash
-curl http://127.0.0.1:8000/
-# => {"ok": true, "message": "Hello from RAGChatBot"}
+## Debug Helpers
+
+### Random Sample Chunks
+
+```cmd
+curl -s -H "X-API-Key: %KEY%" "%URL%/debug/samples?n=3"
 ```
 
-OpenAPI docs: **http://localhost:8000/docs**
+### Search Smoke Test
 
----
-
-## 📥 Ingest Documents
-
-Place files under `./data/docs` or pass explicit paths.
-
-```bash
-curl -X POST "http://localhost:8000/ingest"   -H "X-API-Key: dev"   -H "Content-Type: application/json"   -d '{"paths": ["./data/docs"]}'
+```cmd
+curl -s -H "X-API-Key: %KEY%" "%URL%/debug/search?q=Normans&k=5&max_distance=0.60"
 ```
 
-- Accepts `.md` and `.txt`
-- Skips oversized files (configurable)
-- Chunks stored in **ChromaDB** for retrieval
+## API Usage
 
----
+### RC Endpoint (Pure Extractive Over Provided Context)
 
-## 💬 Ask a Question
-
-Non-streaming (returns JSON):
-```bash
-curl -X POST "http://localhost:8000/chat?max_distance=0.65"   -H "X-API-Key: dev"   -H "Content-Type: application/json"   -d '{"question": "What is RAG?", "top_k": 4}'
+```cmd
+curl -s -X POST "%URL%/rc" ^
+  -H "X-API-Key: %KEY%" -H "Content-Type: application/json" ^
+  --data-binary "{\"question\":\"Who were the Normans descended from?\", \"context\":\"The Normans ... were descended from Norse raiders and pirates from Denmark, Iceland and Norway.\"}"
 ```
 
-Streaming (SSE):
-```bash
-curl -N -X POST "http://localhost:8000/chat?stream=true&max_distance=0.65"   -H "X-API-Key: dev"   -H "Content-Type: application/json"   -d '{"question": "Summarize the docs", "top_k": 4}'
+### Chat Endpoint (Two Recommended Presets)
+
+#### A) Generative Grounded (Fast, Well-Calibrated)
+
+```
+%URL%/chat?extractive=0&grounded_only=1&top_k=5&max_distance=0.60&null_threshold=0.25&rerank=1&rerank_lex_w=0.5&temperature=0
 ```
 
-Health:
-```bash
-curl "http://localhost:8000/health/ollama"
+#### B) Extractive (Span-First)
+
+```
+%URL%/chat?extractive=1&grounded_only=1&top_k=3&max_distance=0.60&null_threshold=0.60&rerank=1&rerank_lex_w=0.5&alpha=0.50&alpha_hits=2&support_min=0.30&support_window=96&span_max_distance=0.60&temperature=0
 ```
 
-Debug (no LLM, preview chunks):
-```bash
-curl "http://localhost:8000/debug-search?q=embedding&k=4&max_distance=0.65"
-curl "http://localhost:8000/debug-ingest?n=10"
+**Notes**: These reflect your best runs - generative is faster and better-calibrated; extractive slightly higher overall F1.
+
+## Evaluation
+
+Run a 500-example SQuADv2 sweep and generate leaderboards. If you already have results JSONs, you can skip to the "Build tables and graph" section.
+
+### Example: Generative Grounded Highlight Run
+
+```cmd
+python scripts\squad_eval.py ^
+  --dataset "%DATASET%" --host "%URL%" --api-key "%KEY%" ^
+  --grounded-only ^
+  --top-k 5 --max-distance 0.60 --null-threshold 0.25 ^
+  --temperature 0 --workers 4 --timeout 180 --limit 500 ^
+  --progress --progress-interval 50 ^
+  --out results\gen_k5_md060_nt0p25_rerank1.json ^
+  --rerank --rerank-lex-w 0.5
 ```
 
----
+### Example: Extractive Highlight Run
 
-## 🖥️ Minimal Frontend (Streamlit)
-
-A simple demo UI is included.
-
-```bash
-# from repo root
-pip install streamlit requests   # or use a separate venv
-API_KEY=dev RAG_API_BASE=http://localhost:8000 streamlit run frontend/app.py
+```cmd
+python scripts\squad_eval.py ^
+  --dataset "%DATASET%" --host "%URL%" --api-key "%KEY%" ^
+  --extractive --grounded-only ^
+  --rerank --rerank-lex-w 0.5 ^
+  --top-k 3 --max-distance 0.60 --null-threshold 0.60 ^
+  --alpha 0.50 --alpha-hits 2 ^
+  --support-min 0.30 --support-window 96 ^
+  --span-max-distance 0.60 ^
+  --temperature 0 --workers 4 --timeout 180 --limit 500 ^
+  --progress --progress-interval 50 ^
+  --out results\ex_sd0p60.json
 ```
 
-Open **http://localhost:8501**:
-- Enter your API key (`dev` by default)
-- Ask a question
-- See answer + sources (filenames and snippets)
+## Build Tables and Graph (Leaderboards + Pareto Scatter)
 
----
+**Prerequisites**: Python, pandas, matplotlib installed. Place `scripts\build_leaderboards.py` in your repo.
 
-## 📊 Metrics
+### Auto-detect Newest Results Subfolder
 
-Prometheus-compatible endpoint:
-```
-GET /metrics
+```cmd
+python scripts\build_leaderboards.py
 ```
 
-Exposes:
-- `rag_retrieval_chunks` — number of chunks used per query
-- `rag_llm_request_total{status=...}` — total LLM requests by outcome
-- `rag_llm_latency_seconds` — LLM latency histogram
+### Or Specify a Folder Explicitly
 
-Pair with **Grafana** for dashboards (export the `/metrics` target).
-
----
-
-## ⚙️ Configuration
-
-All via `.env` (with safe defaults):
-
-| Key               | Description                                   | Example                                 |
-|-------------------|-----------------------------------------------|-----------------------------------------|
-| `API_KEY`         | Required API key for POST endpoints           | `dev`                                   |
-| `OLLAMA_HOST`     | Ollama server URL                              | `http://127.0.0.1:11434`                |
-| `OLLAMA_MODEL`    | Model name                                     | `llama3.1:8b-instruct-q4_K_M`           |
-| `NUM_CTX`         | Context tokens for LLM                         | `2048`                                  |
-| `OLLAMA_TIMEOUT`  | Upstream timeout (seconds)                     | `60`                                    |
-| `MAX_BYTES`       | Max request size (bytes)                       | `32768`                                 |
-| `CHROMA_DIR`      | ChromaDB persistence dir                       | `./data/chroma`                         |
-| `DOCS_DIR`        | Default docs dir to ingest                     | `./data/docs`                           |
-| `TOP_K`           | Default retrieval top-k                        | `4`                                     |
-| `CHUNK_SIZE`      | Chunk size (characters)                        | `600`                                   |
-| `CHUNK_OVERLAP`   | Overlap between chunks                         | `120`                                   |
-| `EMBED_MODEL`     | Embedding model name                           | `BAAI/bge-small-en-v1.5`                |
-| `CORS_ORIGIN`     | Allowed origin for browser apps                | `http://localhost:3000`                 |
-
----
-
-## 🔐 Security
-
-- API key required for **POST** endpoints via `X-API-Key`
-- Body size limit (413) via middleware
-- CORS restricted to your frontend origin
-- Non-root containers; minimal base images
-
-> For public deployments, also consider rate limiting, auth providers, and TLS termination.
-
----
-
-## 🧪 Testing & CI (Docker-native)
-
-Unit tests (mocked Ollama) run inside a dedicated **test stage** image.
-
-```bash
-# build test stage and run tests
-docker build --target test -t ragchatbot:test .
-docker run --rm -e API_KEY=dev ragchatbot:test
-
-# run Ruff lint
-docker run --rm ragchatbot:test /opt/venv/bin/ruff check .
+```cmd
+python scripts\build_leaderboards.py --folder results\YYYYMMDD_HHMMSS
 ```
 
-GitHub Actions:
-- Builds the **test** stage (no Ollama needed)
-- Passes `API_KEY` as a secret
-- Runs unit tests + Ruff
+### Outputs
 
----
+- `docs\combined_eval_table.csv` - One row per JSON; F1, EM, NoAns, p50_ms, and all key knobs
+- `docs\pareto_scatter.png` - Overall F1 vs NoAns Accuracy; point size ~ 1/sqrt(p50_ms)
 
-## 🖼️ Screenshots
+The script also prints three leaderboards to the console:
+- Top 10 by Overall F1
+- Top 10 by NoAns Accuracy  
+- Top 10 by Answerable F1
 
-> _Add your screenshots to `docs/screenshots/` and update these paths:_
+## Results Snapshot (SQuADv2 Dev Slice, k ≤ 5)
 
-- **Frontend UI**  
-  ![Frontend](docs/screenshots/frontend.png)
+### Best Generative (Grounded)
+- **Overall F1**: ~0.52
+- **EM**: ~0.49
+- **NoAns**: ~0.74
+- **p50**: ~614 ms
+- **Params**: `top_k=5`, `max_distance=0.60`, `null_threshold=0.25`, `rerank=1`, `rerank_lex_w=0.5`, `grounded_only=1`, `temperature=0`
 
-- **OpenAPI Docs**  
-  ![OpenAPI](docs/screenshots/openapi.png)
+### Best Extractive (Span-First)
+- **Overall F1**: ~0.53
+- **EM**: ~0.50
+- **NoAns**: ~0.67
+- **p50**: ~1250 ms
+- **Params**: `top_k=3`, `max_distance=0.60`, `null_threshold=0.60`, `rerank=1`, `rerank_lex_w=0.5`, `alpha=0.50`, `alpha_hits=2`, `support_min=0.30`, `support_window=96`, `span_max_distance=0.60`, `temperature=0`
 
----
+### Notes
+- These are untrained RAG numbers (no weight fine-tuning)
+- Generative wins on speed and abstention; extractive edges overall F1 slightly
 
-## 🧭 Why this matters
+## API Overview
 
-This project shows end-to-end **engineering maturity**:
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | Service status |
+| GET | `/metrics` | Prometheus metrics |
+| POST | `/ingest` | (Re)load data; body: `{"paths":[]}` |
+| GET | `/debug/samples?n=3` | Random chunk texts |
+| GET | `/debug/search?q=...` | Retrieval only; supports k and max_distance |
+| POST | `/rc` | Extractive RC over provided context |
+| POST | `/chat` | Full RAG |
 
-- **Systems design**: local, reproducible, secure service
-- **ML ops**: embeddings + retrieval + LLM with citations
-- **Platform**: observability, CI, and container best practices
-- **UX**: minimal frontend to demonstrate value quickly
+### Key `/chat` Query Parameters
 
-Use it as:
-- A personal knowledge assistant over your notes/docs
-- A portfolio piece demonstrating production-readiness
-- A foundation for more advanced RAG (re-ranking, evaluators, structured outputs)
+- `extractive=0|1`, `grounded_only=1`, `top_k`, `max_distance`
+- `null_threshold`, `temperature`, `rerank=true|false`, `rerank_lex_w`
+- **Extractive-only gates**: `alpha`, `alpha_hits`, `support_min`, `support_window`, `span_max_distance`
 
----
+### Authentication
 
-## 📄 License
+Use the header: `X-API-Key: your-key-here`
 
-MIT (or your choice). See `LICENSE`.
+## Roadmap (Next Steps)
+
+- **Plug-in rerankers**: Cohere/Voyage (hosted) or local cross-encoder (MiniLM/BGE); keep `?rerank=true` flag
+- **Train a small cross-encoder** reranker on pairs mined from your service (scripts provided)
+- **Retriever tuning** with hard negatives to lift Recall@k and answerable F1
+- **Learned abstention head** for tighter calibration (optional)
+
+## Are These Results "Good"?
+
+For an untrained RAG over SQuADv2 with small k and a light reranker, yes:
+- Overall F1 about 0.52—0.53
+- NoAns about 0.67—0.74
+- p50 about 0.6—1.25 s
+
+The main headroom is answerable F1; a stronger reranker is typically the next lever.
+
+## License and Data
+
+- **Code**: Choose a license (for example, MIT)
+- **Data**: SQuAD v2.0. Respect the original license/attribution
