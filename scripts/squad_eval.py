@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # scripts/squad_eval.py
 from __future__ import annotations
 import argparse, json, re, time, threading, statistics as stats
@@ -6,7 +7,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import requests
 
-# -------- Normalization / Metrics (kept close to your originals) --------
+# -------- Normalization / Metrics (your original style, kept) --------
 _ARTICLES = {"a","an","the"}
 _PUNCT_RE = re.compile(r"[!\"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~]")
 _WS_RE = re.compile(r"\s+")
@@ -42,7 +43,7 @@ def f1_score(pred: str, golds: List[str]) -> float:
             best = max(best, 1.0); continue
         # multiset overlap
         num_same = 0
-        gt_counts = {}
+        gt_counts: Dict[str,int] = {}
         for w in gt: gt_counts[w] = gt_counts.get(w, 0) + 1
         for w in pt:
             if gt_counts.get(w, 0) > 0:
@@ -59,8 +60,9 @@ def f1_score(pred: str, golds: List[str]) -> float:
 
 # -------- Data loading --------
 def load_squad_v2(json_path: str) -> List[Dict[str, Any]]:
-    data = json.load(open(json_path, "r", encoding="utf-8"))
-    rows = []
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    rows: List[Dict[str, Any]] = []
     for art in data.get("data", []):
         for para in art.get("paragraphs", []):
             ctx = para.get("context", "")
@@ -93,12 +95,19 @@ def call_chat(
     null_threshold: Optional[float],
     temperature: float,
     timeout: float,
+    *,
+    # Extractive / A2 gates
     extractive: bool = False,
     alpha: Optional[float] = None,
     alpha_hits: Optional[int] = None,
     support_min: Optional[float] = None,
     support_window: Optional[int] = None,
     span_max_distance: Optional[float] = None,
+    # Reranker / A3
+    rerank: bool = False,
+    rerank_lex_w: Optional[float] = None,
+    # Sampling
+    top_p: Optional[float] = None,
 ) -> Tuple[str, Optional[int], str]:
     params: Dict[str, Any] = {
         "grounded_only": str(grounded_only).lower(),
@@ -107,9 +116,10 @@ def call_chat(
     }
     if null_threshold is not None:
         params["null_threshold"] = null_threshold
+
+    # Extractive path
     if extractive:
         params["extractive"] = 1
-        # Optional pre-abstain + evidence gates
         if alpha is not None:
             params["alpha"] = alpha
         if alpha_hits is not None:
@@ -120,6 +130,16 @@ def call_chat(
             params["support_window"] = support_window
         if span_max_distance is not None:
             params["span_max_distance"] = span_max_distance
+
+    # Reranker
+    if rerank:
+        params["rerank"] = "true"
+        if rerank_lex_w is not None:
+            params["rerank_lex_w"] = rerank_lex_w
+
+    # Optional sampling knob
+    if top_p is not None:
+        params["top_p"] = top_p
 
     payload = {"question": q, "top_k": top_k}
     headers = {
@@ -143,29 +163,47 @@ def main():
     ap.add_argument("--dataset", required=True, help="Path to SQuAD v2 dev JSON")
     ap.add_argument("--host", default="http://127.0.0.1:8000")
     ap.add_argument("--api-key", required=True)
-    ap.add_argument("--extractive", action="store_true",
-                    help="Enable extractive answering (A1+A2) by sending ?extractive=1")
-    ap.add_argument("--alpha", type=float, default=None,
-                    help="(extractive only) distance cutoff for extra pre-abstain gate, e.g. 0.55")
-    ap.add_argument("--alpha-hits", type=int, default=None,
-                    help="(extractive only) require at least this many chunks under --alpha (e.g., 1)")
-    ap.add_argument("--support-min", type=float, default=None,
-                    help="(extractive only) min lexical-overlap support around evidence (e.g., 0.35)")
-    ap.add_argument("--support-window", type=int, default=None,
-                    help="(extractive only) half-window size (chars) around evidence for support (e.g., 128)")
-    ap.add_argument("--span-max-distance", type=float, default=None,
-                    help="(extractive only) require the evidence chunk distance ≤ this value (e.g., 0.55)")
+
+    # Split/slicing
     ap.add_argument("--limit", type=int, default=200)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--split", choices=["all","answerable","unanswerable"], default="all")
+
+    # Core retrieval / abstention
     ap.add_argument("--grounded-only", action="store_true")
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--max-distance", type=float, default=0.70)
     ap.add_argument("--null-threshold", type=float)
     ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-p", type=float, default=None, help="Optional; server may ignore")
+
+    # Extractive + gates (A2)
+    ap.add_argument("--extractive", action="store_true",
+                    help="Enable extractive answering (A1+A2) by sending ?extractive=1")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="(extractive) distance cutoff for pre-abstain gate (e.g., 0.55)")
+    ap.add_argument("--alpha-hits", type=int, default=None,
+                    help="(extractive) require at least this many chunks under --alpha")
+    ap.add_argument("--support-min", type=float, default=None,
+                    help="(extractive) min lexical-overlap support around evidence")
+    ap.add_argument("--support-window", type=int, default=None,
+                    help="(extractive) half-window chars around evidence for support (e.g., 96/128/160)")
+    ap.add_argument("--span-max-distance", type=float, default=None,
+                    help="(extractive) evidence chunk distance must be ≤ this value")
+
+    # Reranker (A3)
+    ap.add_argument("--rerank", action="store_true", help="Enable reranker")
+    ap.add_argument("--rerank-lex-w", type=float, default=0.50, help="Lexical weight when rerank is enabled")
+
+    # Runtime
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--timeout", type=float, default=180.0)
     ap.add_argument("--out", help="Optional path to write JSON summary")
+
+    # Progress (combined system)
+    ap.add_argument("--progress", action="store_true", help="Print periodic status updates")
+    ap.add_argument("--progress-interval", type=int, default=25, help="Update every N items")
+
     args = ap.parse_args()
 
     all_rows = load_squad_v2(args.dataset)
@@ -189,6 +227,8 @@ def main():
             extractive=args.extractive, alpha=args.alpha, alpha_hits=args.alpha_hits,
             support_min=args.support_min, support_window=args.support_window,
             span_max_distance=args.span_max_distance,
+            rerank=args.rerank, rerank_lex_w=args.rerank_lex_w,
+            top_p=args.top_p,
         )
         if status != "ok":
             return 0.0, 0.0, row["is_impossible"], None, True
@@ -199,6 +239,7 @@ def main():
         F1 = float(f1_score(pred_eval, gts))
         return EM, F1, row["is_impossible"], ms, False
 
+    total = len(rows)
     if args.workers <= 1:
         for i, r in enumerate(rows, 1):
             EM, F1, is_unans, ms, err = work(r)
@@ -208,8 +249,10 @@ def main():
                 if is_unans: unans_em += EM; unans_f1 += F1; unans_n += 1
                 else:        ans_em += EM;   ans_f1 += F1;   ans_n   += 1
                 if ms is not None: latencies.append(ms)
-            if i % 25 == 0:
-                print(f"  [{i}/{len(rows)}] running EM={em_sum/max(i,1):.3f} F1={f1_sum/max(i,1):.3f}")
+            if args.progress and (i % args.progress_interval == 0 or i == total):
+                running_em = em_sum / max(i - errors, 1)
+                running_f1 = f1_sum / max(i - errors, 1)
+                print(f"  [{i}/{total}] EM={running_em:.3f} F1={running_f1:.3f}")
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futs = [ex.submit(work, r) for r in rows]
@@ -223,10 +266,12 @@ def main():
                     if is_unans: unans_em += EM; unans_f1 += F1; unans_n += 1
                     else:        ans_em += EM;   ans_f1 += F1;   ans_n   += 1
                     if ms is not None: latencies.append(ms)
-                if done % 25 == 0:
-                    print(f"  [{done}/{len(rows)}] running EM={em_sum/done:.3f} F1={f1_sum/done:.3f}")
+                if args.progress and (done % args.progress_interval == 0 or done == total):
+                    running_em = em_sum / max(done - errors, 1)
+                    running_f1 = f1_sum / max(done - errors, 1)
+                    print(f"  [{done}/{total}] EM={running_em:.3f} F1={running_f1:.3f}")
 
-    n = max(len(rows) - errors, 1)
+    n = max(total - errors, 1)
     overall_em = em_sum / n
     overall_f1 = f1_sum / n
     ans_em_avg = (ans_em / ans_n) if ans_n else None
@@ -243,7 +288,7 @@ def main():
     }
 
     summary = {
-        "n": len(rows), "errors": errors,
+        "n": total, "errors": errors,
         "overall": {"EM": round(overall_em,4), "F1": round(overall_f1,4)},
         "answerable": {"n": int(ans_n), "EM": round(ans_em_avg,4) if ans_em_avg is not None else None,
                        "F1": round(ans_f1_avg,4) if ans_f1_avg is not None else None},
@@ -254,10 +299,12 @@ def main():
         "settings": {
             "host": args.host, "grounded_only": args.grounded_only, "extractive": args.extractive, "top_k": args.top_k,
             "max_distance": args.max_distance, "null_threshold": getattr(args, "null_threshold", None),
-            "temperature": args.temperature, "workers": args.workers, "timeout": args.timeout,
+            "temperature": args.temperature, "top_p": args.top_p,
+            "workers": args.workers, "timeout": args.timeout,
             "alpha": args.alpha, "alpha_hits": args.alpha_hits,
             "support_min": args.support_min, "support_window": args.support_window,
             "span_max_distance": args.span_max_distance,
+            "rerank": args.rerank, "rerank_lex_w": args.rerank_lex_w,
         }
     }
 
