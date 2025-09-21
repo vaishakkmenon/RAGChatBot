@@ -255,7 +255,7 @@ def _find_span_basic(answer: str, text: str) -> Optional[Tuple[int, int]]:
 def _find_span_subseq(answer: str, text: str) -> Optional[Tuple[int, int]]:
     """
     Ordered token-subsequence fallback.
-    Tokenize with \w+; match tokens in order (case-insensitive).
+    Tokenize with '\'w+; match tokens in order (case-insensitive).
     Return a single contiguous char span from first to last token match.
     """
     ans_tokens = _TOK_RE.findall(answer)
