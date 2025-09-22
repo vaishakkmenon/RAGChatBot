@@ -1,0 +1,45 @@
+{
+  "n": 500,
+  "errors": 0,
+  "overall": {
+    "EM": 0.518,
+    "F1": 0.542
+  },
+  "answerable": {
+    "n": 237,
+    "EM": 0.1435,
+    "F1": 0.1941
+  },
+  "unanswerable": {
+    "n": 263,
+    "EM": 0.8555,
+    "F1": 0.8555,
+    "NoAns_Accuracy": 0.8555
+  },
+  "latency": {
+    "count": 500,
+    "avg_ms": 461.28,
+    "p50_ms": 127,
+    "p90_ms": 1265,
+    "p99_ms": 2782
+  },
+  "settings": {
+    "host": "http://127.0.0.1:8000",
+    "grounded_only": true,
+    "extractive": false,
+    "top_k": 3,
+    "max_distance": 0.6,
+    "null_threshold": 0.23,
+    "temperature": 0.0,
+    "top_p": null,
+    "workers": 4,
+    "timeout": 180.0,
+    "alpha": null,
+    "alpha_hits": null,
+    "support_min": null,
+    "support_window": null,
+    "span_max_distance": null,
+    "rerank": false,
+    "rerank_lex_w": 0.5
+  }
+}
